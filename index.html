@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>双人合作攀岩 Demo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="game">
+        <canvas id="game" width="960" height="720" aria-label="双人合作攀岩 Canvas"></canvas>
+      </section>
+      <aside class="panel">
+        <h1>双人合作攀岩</h1>
+        <div class="status">
+          <div>
+            <span>稳定度</span>
+            <strong id="stabilityText">-</strong>
+          </div>
+          <div>
+            <span>高度</span>
+            <strong id="heightText">-</strong>
+          </div>
+          <div>
+            <span>石头承重</span>
+            <strong id="stoneText">-</strong>
+          </div>
+        </div>
+        <div class="limb-panel" id="limbPanel" aria-label="四肢疲劳与受力状态"></div>
+        <details class="fold">
+          <summary>
+            <span>联机设置</span>
+            <strong id="netStatus">离线单机</strong>
+          </summary>
+          <div class="net-panel">
+            <label class="role-choice">
+              我想当
+              <select id="playerRole">
+                <option value="climber">攀岩者</option>
+                <option value="stone">石头</option>
+              </select>
+            </label>
+            <div class="net-actions">
+              <button id="createRoom" type="button">创建房间</button>
+              <input id="roomCode" type="text" maxlength="6" placeholder="房间码" />
+              <button id="joinRoom" type="button">加入</button>
+            </div>
+            <div class="net-role" id="roleText">房主控制攀岩者，加入者控制石头。</div>
+          </div>
+        </details>
+        <div id="message" class="message">选择一个肢体开始攀爬。</div>
+        <details class="fold">
+          <summary>
+            <span>操作说明</span>
+          </summary>
+          <div class="controls">
+            <h2>攀岩者</h2>
+            <p>按 <kbd>Q</kbd><kbd>E</kbd><kbd>A</kbd><kbd>D</kbd> 选择左手、右手、左脚、右脚。选中后肢体跟随鼠标，点击墙面或石头手动固定。</p>
+            <h2>石头</h2>
+            <p><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> 移动伙伴石头，<kbd>Space</kbd> 固定或解除。石头只能在攀岩者附近移动。</p>
+            <h2>规则</h2>
+            <p>缺口区域没有天然抓点，需要石头临时承重。明显突起抓力高，粗糙墙面中等，平滑墙面抓力低。</p>
+          </div>
+        </details>
+      </aside>
+    </main>
+    <script src="game.js"></script>
+  </body>
+</html>

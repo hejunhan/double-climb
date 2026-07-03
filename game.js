@@ -61,6 +61,8 @@ const state = {
   body: { x: wall.x + CFG.wallWidth / 2, y: 1880, vx: 0, vy: 0, angle: 0 },
   limbTarget: null,
   bodyExtensionTarget: null,
+  supplyPickerOpen: false,
+  supplyPromptLimb: null,
   targetLocked: false,
   lastPointer: null,
   ignorePointerUntilMove: false,
@@ -93,6 +95,15 @@ const roughPatches = [
 ];
 
 const holds = buildHolds();
+
+function defaultSupplies() {
+  return [
+    { id: "water", label: "水", color: "#6bb7ff", useTarget: "mouth" },
+    { id: "biscuit", label: "压缩饼干", color: "#d6a85b", useTarget: "mouth" },
+    { id: "bandage", label: "绷带", color: "#f2f0df", useTarget: "injury" },
+  ];
+}
+
 const stone = {
   x: state.body.x + 110,
   y: state.body.y - 40,
@@ -103,6 +114,7 @@ const stone = {
   shake: 0,
   grip: 0.95,
   kind: "stone",
+  supplies: defaultSupplies(),
 };
 
 const limbs = Object.fromEntries(
@@ -118,6 +130,7 @@ const limbs = Object.fromEntries(
       jointY: state.body.y + (def.root.y + def.rest.y) / 2,
       attached: false,
       target: null,
+      heldSupply: null,
       grip: 1,
       fatigue: 0,
       load: 0,
@@ -150,6 +163,11 @@ updateNetUi();
 
 window.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
+  if (event.ctrlKey && key === "c") {
+    event.preventDefault();
+    capturePoseSnapshot();
+    return;
+  }
   state.keys.add(key);
   if (isStoneControl(event)) {
     event.preventDefault();
@@ -171,7 +189,7 @@ window.addEventListener("keydown", (event) => {
       selectLimb(def.id);
     }
   }
-  if (key === "f") capturePoseSnapshot();
+  if (key === "f") handleSupplyKey();
   if (key === "r" && NET.role !== "guest") resetGame();
 });
 
@@ -185,11 +203,17 @@ window.addEventListener("keyup", (event) => {
 
 canvas.addEventListener("pointerdown", (event) => {
   if (!controlsClimber()) return;
+  if (state.supplyPickerOpen) {
+    pickSupplyFromPointer(event);
+    return;
+  }
+  if (limbs[state.selected]?.heldSupply) return;
   tryAttachSelectedFromPointer(event);
 });
 
 canvas.addEventListener("pointermove", (event) => {
   if (!controlsClimber()) return;
+  if (state.supplyPickerOpen) return;
   setLimbTargetFromPointer(event);
 });
 
@@ -246,6 +270,7 @@ function update(dt) {
   state.messageTimer = Math.max(0, state.messageTimer - dt);
   updateClimberControl(dt);
   updateStone(dt);
+  updateSupplyPrompt();
   updatePose(dt);
   updateFatigue(dt);
   updateCamera(dt);
@@ -277,7 +302,7 @@ function updateStone(dt) {
       stone.shake = 0;
     }
     if (stone.currentLoadTime >= CFG.stoneMaxLoadTime) {
-      releaseStone("石头承重过久，已经松脱。");
+      releaseStone("攀岩机器人承重过久，已经松脱。");
     }
   }
 }
@@ -455,7 +480,7 @@ function controlsStone() {
 }
 
 function roleLabel(role) {
-  return role === "stone" ? "石头" : "攀岩者";
+  return role === "stone" ? "攀岩机器人" : "攀岩者";
 }
 
 function updateNetUi() {
@@ -552,6 +577,10 @@ function updatePose(dt) {
 
   for (const limb of Object.values(limbs)) {
     if (!limb.attached) {
+      if (state.supplyPickerOpen && limb.id === state.supplyPromptLimb) {
+        solveLimbIK(limb);
+        continue;
+      }
       const targetX = state.body.x + limb.rest.x;
       const targetY = state.body.y + limb.rest.y;
       limb.x += (targetX - limb.x) * 6 * dt;
@@ -738,6 +767,110 @@ function tryAttachSelectedAt(x, y) {
   say(`${limb.label}已固定，抓力 ${Math.round(target.grip * 100)}%。`);
 }
 
+function handAtRobot() {
+  return Object.values(limbs)
+    .filter((limb) => limb.joint === "elbow")
+    .find((limb) => distance(limb, stone) <= CFG.gripRadius + stone.r);
+}
+
+function updateSupplyPrompt() {
+  if (state.supplyPickerOpen) return;
+  state.supplyPromptLimb = handAtRobot()?.id || null;
+}
+
+function openSupplyPicker() {
+  updateSupplyPrompt();
+  if (!state.supplyPromptLimb) return;
+  if (!stone.supplies.length) {
+    say("攀岩机器人没有剩余物资。");
+    return;
+  }
+  state.supplyPickerOpen = true;
+  state.limbTarget = null;
+  state.targetLocked = true;
+  say("选择要拿取的物资。");
+}
+
+function handleSupplyKey() {
+  const carrying = Object.values(limbs).find((limb) => limb.heldSupply);
+  if (carrying) {
+    tryUseHeldSupply(carrying);
+    return;
+  }
+  openSupplyPicker();
+}
+
+function supplySlots() {
+  const slotSize = 34;
+  const gap = 8;
+  const total = stone.supplies.length * slotSize + Math.max(0, stone.supplies.length - 1) * gap;
+  const startX = stone.x - total / 2;
+  const y = stone.y - stone.r - 54;
+  return stone.supplies.map((supply, index) => ({
+    supply,
+    x: startX + index * (slotSize + gap),
+    y,
+    w: slotSize,
+    h: slotSize,
+  }));
+}
+
+function pickSupplyFromPointer(event) {
+  const pos = screenToWorld(event);
+  const slot = supplySlots().find((item) => (
+    pos.x >= item.x && pos.x <= item.x + item.w && pos.y >= item.y && pos.y <= item.y + item.h
+  ));
+  if (!slot) {
+    state.supplyPickerOpen = false;
+    state.targetLocked = false;
+    return;
+  }
+  const hand = limbs[state.supplyPromptLimb] || limbs[state.selected];
+  if (!hand || hand.joint !== "elbow") return;
+  hand.heldSupply = slot.supply;
+  stone.supplies = stone.supplies.filter((item) => item.id !== slot.supply.id);
+  state.selected = hand.id;
+  state.supplyPickerOpen = false;
+  state.targetLocked = false;
+  state.limbTarget = { x: hand.x, y: hand.y };
+  say(`${hand.label}拿到了${slot.supply.label}。`);
+}
+
+function supplyUsePoint(supply) {
+  if (supply.useTarget === "mouth") return bodyPoint({ x: 0, y: -72 });
+  const injured = Object.values(limbs).sort((a, b) => b.fatigue - a.fatigue)[0];
+  if (injured && injured.fatigue > 0.12) {
+    return { x: injured.x, y: injured.y };
+  }
+  return bodyPoint({ x: 0, y: 0 });
+}
+
+function tryUseHeldSupply(limb) {
+  const supply = limb.heldSupply;
+  if (!supply) return;
+  const target = supplyUsePoint(supply);
+  if (distance(limb, target) > 34) {
+    say(`${supply.label}还没送到可使用位置。`);
+    return;
+  }
+  useHeldSupply(limb);
+}
+
+function useHeldSupply(limb) {
+  const supply = limb.heldSupply;
+  if (!supply) return;
+  if (supply.id === "water") {
+    for (const item of Object.values(limbs)) item.fatigue = Math.max(0, item.fatigue - 0.1);
+  } else if (supply.id === "biscuit") {
+    for (const item of Object.values(limbs)) item.fatigue = Math.max(0, item.fatigue - 0.16);
+  } else if (supply.id === "bandage") {
+    const injured = Object.values(limbs).sort((a, b) => b.fatigue - a.fatigue)[0];
+    if (injured) injured.fatigue = Math.max(0, injured.fatigue - 0.42);
+  }
+  say(`${limb.label}使用了${supply.label}。`);
+  limb.heldSupply = null;
+}
+
 function gripAt(x, y) {
   const candidates = [...holds];
   if (stone.isFixed) candidates.push(stone);
@@ -745,7 +878,7 @@ function gripAt(x, y) {
     .map((item) => ({ item, d: Math.hypot(item.x - x, item.y - y) }))
     .sort((a, b) => a.d - b.d)[0];
   if (nearest && nearest.d <= CFG.gripRadius) {
-    return { ...nearest.item, grip: nearest.item.grip ?? 1, kind: nearest.item === stone ? "stone" : "hold" };
+    return { ...nearest.item, grip: nearest.item.grip ?? 1, kind: nearest.item === stone ? "robot" : "hold" };
   }
   const rough = roughPatches.find((patch) => x >= patch.x && x <= patch.x + patch.w && y >= patch.y && y <= patch.y + patch.h);
   if (rough) return { id: `rough-${Math.round(x)}-${Math.round(y)}`, x, y, grip: rough.grip, kind: "rough" };
@@ -791,6 +924,7 @@ function capturePoseSnapshot() {
         attached: limb.attached,
         targetId: limb.target?.id || null,
         targetKind: limb.target?.kind || null,
+        heldSupply: limb.heldSupply ? limb.heldSupply.id : null,
         endpoint: roundPoint(limb),
         root: roundPoint(root),
         jointPoint: { x: roundNumber(limb.jointX), y: roundNumber(limb.jointY) },
@@ -909,20 +1043,20 @@ function detachLimb(limb, message) {
 
 function toggleStone() {
   if (stone.isFixed) {
-    releaseStone("石头解除固定。");
+    releaseStone("攀岩机器人解除固定。");
     return;
   }
   constrainStoneNearBody();
   stone.isFixed = true;
   stone.currentLoadTime = Math.min(stone.currentLoadTime, CFG.stoneMaxLoadTime * 0.5);
-  say("石头已固定，可作为临时手点或脚点。");
+  say("攀岩机器人已固定，可作为临时手点、脚点或物资点。");
 }
 
 function releaseStone(message) {
   stone.isFixed = false;
   stone.shake = 0;
   for (const limb of Object.values(limbs)) {
-    if (limb.target === stone) detachLimb(limb, "抓住石头的肢体已脱落。");
+    if (limb.target === stone) detachLimb(limb, "抓住攀岩机器人的肢体已脱落。");
   }
   say(message);
 }
@@ -932,10 +1066,14 @@ function resetGame() {
   state.cameraY = 1180;
   state.selected = "leftHand";
   state.won = false;
+  state.supplyPickerOpen = false;
+  state.supplyPromptLimb = null;
+  state.bodyExtensionTarget = null;
   stone.x = state.body.x + 110;
   stone.y = state.body.y - 40;
   stone.isFixed = false;
   stone.currentLoadTime = 0;
+  stone.supplies = defaultSupplies();
   for (const def of limbDefs) {
     const limb = limbs[def.id];
     limb.x = state.body.x + def.rest.x;
@@ -946,6 +1084,7 @@ function resetGame() {
     limb.jointY = state.body.y + (def.root.y + def.rest.y) / 2;
     limb.attached = false;
     limb.target = null;
+    limb.heldSupply = null;
     limb.grip = 1;
     limb.fatigue = 0;
   }
@@ -1014,17 +1153,102 @@ function drawHolds() {
 function drawStone() {
   const x = stone.x + stone.shake * (Math.random() - 0.5);
   const y = stone.y + stone.shake * (Math.random() - 0.5);
-  ctx.fillStyle = stone.isFixed ? "#6bd1d5" : "#d8d0b0";
-  ctx.strokeStyle = stone.isFixed ? "#d3fbff" : "#fff1c8";
+  ctx.fillStyle = stone.isFixed ? "#5fb7c8" : "#9aa7ad";
+  ctx.strokeStyle = stone.isFixed ? "#d3fbff" : "#dce4e7";
   ctx.lineWidth = 3;
   ctx.beginPath();
-  ctx.arc(x, y, stone.r, 0, Math.PI * 2);
+  ctx.roundRect(x - stone.r, y - stone.r, stone.r * 2, stone.r * 2, 8);
   ctx.fill();
   ctx.stroke();
+  ctx.fillStyle = "#182024";
+  ctx.fillRect(x - 9, y - 5, 6, 6);
+  ctx.fillRect(x + 3, y - 5, 6, 6);
+  ctx.strokeStyle = "#182024";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x - 8, y + 9);
+  ctx.lineTo(x + 8, y + 9);
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "11px Segoe UI, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("攀岩机器人", x, y + stone.r + 16);
+  ctx.textAlign = "left";
   if (!stone.isFixed) {
     ctx.strokeStyle = "rgba(107,209,213,0.22)";
     ctx.beginPath();
     ctx.arc(state.body.x, state.body.y, CFG.moveRadius, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (state.supplyPromptLimb && !state.supplyPickerOpen) {
+    drawRobotPrompt(x, y);
+  }
+  if (state.supplyPickerOpen) {
+    drawSupplyPicker();
+  }
+}
+
+function drawRobotPrompt(x, y) {
+  ctx.fillStyle = "rgba(16,20,22,0.86)";
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.lineWidth = 1;
+  const text = "按 F 拿取物资";
+  ctx.font = "13px Segoe UI, sans-serif";
+  const w = ctx.measureText(text).width + 22;
+  const h = 28;
+  ctx.beginPath();
+  ctx.roundRect(x - w / 2, y - stone.r - 42, w, h, 8);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.fillText(text, x, y - stone.r - 23);
+  ctx.textAlign = "left";
+}
+
+function drawSupplyPicker() {
+  for (const slot of supplySlots()) {
+    ctx.fillStyle = "rgba(16,20,22,0.9)";
+    ctx.strokeStyle = "rgba(255,255,255,0.32)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(slot.x, slot.y, slot.w, slot.h, 7);
+    ctx.fill();
+    ctx.stroke();
+    drawSupplyIcon(slot.supply, slot.x + slot.w / 2, slot.y + slot.h / 2, 11);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "10px Segoe UI, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(slot.supply.label, slot.x + slot.w / 2, slot.y + slot.h + 12);
+    ctx.textAlign = "left";
+  }
+}
+
+function drawSupplyIcon(supply, x, y, size) {
+  ctx.fillStyle = supply.color;
+  ctx.strokeStyle = "#1c2225";
+  ctx.lineWidth = 2;
+  if (supply.id === "water") {
+    ctx.beginPath();
+    ctx.ellipse(x, y, size * 0.62, size, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  } else if (supply.id === "biscuit") {
+    ctx.beginPath();
+    ctx.roundRect(x - size, y - size * 0.65, size * 2, size * 1.3, 4);
+    ctx.fill();
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.roundRect(x - size, y - size * 0.45, size * 2, size * 0.9, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.strokeStyle = "#c86464";
+    ctx.beginPath();
+    ctx.moveTo(x - size * 0.45, y);
+    ctx.lineTo(x + size * 0.45, y);
+    ctx.moveTo(x, y - size * 0.45);
+    ctx.lineTo(x, y + size * 0.45);
     ctx.stroke();
   }
 }
@@ -1064,6 +1288,10 @@ function drawClimber() {
   ctx.restore();
 
   for (const limb of Object.values(limbs)) {
+    if (limb.heldSupply) drawSupplyUseTarget(limb.heldSupply);
+  }
+
+  for (const limb of Object.values(limbs)) {
     solveLimbIK(limb);
     ctx.strokeStyle = limb.attached ? limb.color : "#8a9397";
     ctx.lineWidth = limb.id.includes("Hand") ? 6 : 7;
@@ -1085,6 +1313,9 @@ function drawClimber() {
     ctx.beginPath();
     ctx.arc(limb.x, limb.y, state.selected === limb.id ? 11 : 8, 0, Math.PI * 2);
     ctx.fill();
+    if (limb.heldSupply) {
+      drawSupplyIcon(limb.heldSupply, limb.x + 13 * limb.side, limb.y - 12, 8);
+    }
     if (limb.attached) {
       ctx.fillStyle = limb.grip > 0.8 ? "#7be08f" : limb.grip > 0.5 ? "#e0b44d" : "#ef6960";
       ctx.font = "10px Segoe UI, sans-serif";
@@ -1111,6 +1342,35 @@ function drawClimber() {
   ctx.beginPath();
   ctx.arc(com.x, com.y, 4, 0, Math.PI * 2);
   ctx.fill();
+}
+
+function drawSupplyUseTarget(supply) {
+  const target = supplyUsePoint(supply);
+  const holder = Object.values(limbs).find((limb) => limb.heldSupply === supply);
+  ctx.strokeStyle = supply.color;
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.arc(target.x, target.y, 22, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.setLineDash([]);
+  if (holder && distance(holder, target) <= 34) {
+    ctx.fillStyle = "rgba(16,20,22,0.86)";
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    const text = `按 F 使用${supply.label}`;
+    ctx.font = "13px Segoe UI, sans-serif";
+    const w = ctx.measureText(text).width + 22;
+    ctx.beginPath();
+    ctx.roundRect(target.x - w / 2, target.y - 48, w, 28, 8);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#ffffff";
+    ctx.textAlign = "center";
+    ctx.fillText(text, target.x, target.y - 29);
+    ctx.textAlign = "left";
+  }
 }
 
 function drawStabilityGuide(attached) {
@@ -1177,7 +1437,7 @@ function updateUi() {
     : "可移动";
   updateLimbPanel();
   if (state.messageTimer <= 0 && !state.won) {
-    ui.message.textContent = state.stability < 0.4 ? "姿态不稳定，尽快增加支点或调整重心。" : "协作移动石头，跨过无抓点缺口。";
+    ui.message.textContent = state.stability < 0.4 ? "姿态不稳定，尽快增加支点或调整重心。" : "协作移动攀岩机器人，跨过无抓点缺口。";
   }
 }
 

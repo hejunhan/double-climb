@@ -22,6 +22,8 @@ const CFG = {
   bodyFollow: 4,
   fatigueRate: 0.08,
   fatigueRecover: 0.15,
+  segmentWearRate: 0.018,
+  segmentRecover: 0.035,
   stoneMaxLoadTime: 4,
   stoneRecover: 1,
   gripRadius: 34,
@@ -31,6 +33,10 @@ const CFG = {
   bodyFootLiftAllowance: 70,
   bodyMinFootReach: 64,
   bodyExtensionMax: 95,
+  ropeSegments: 13,
+  ropeGravity: 10000,
+  ropeDamping: 0.52,
+  ropeConstraintIterations: 12,
   bodyRadius: 30,
   topY: 130,
 };
@@ -63,6 +69,7 @@ const state = {
   bodyExtensionTarget: null,
   supplyPickerOpen: false,
   supplyPromptLimb: null,
+  ropePoints: null,
   targetLocked: false,
   lastPointer: null,
   ignorePointerUntilMove: false,
@@ -104,6 +111,13 @@ function defaultSupplies() {
   ];
 }
 
+function createSegments() {
+  return {
+    upper: { condition: 1 },
+    lower: { condition: 1 },
+  };
+}
+
 const stone = {
   x: state.body.x + 110,
   y: state.body.y - 40,
@@ -131,6 +145,7 @@ const limbs = Object.fromEntries(
       attached: false,
       target: null,
       heldSupply: null,
+      segments: createSegments(),
       grip: 1,
       fatigue: 0,
       load: 0,
@@ -272,6 +287,8 @@ function update(dt) {
   updateStone(dt);
   updateSupplyPrompt();
   updatePose(dt);
+  applyRopeConstraint();
+  updateRope(dt);
   updateFatigue(dt);
   updateCamera(dt);
   if (state.body.y <= CFG.topY) {
@@ -512,6 +529,116 @@ function constrainStoneNearBody() {
   }
 }
 
+function applyRopeConstraint() {
+  const dx = stone.x - state.body.x;
+  const dy = stone.y - state.body.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= CFG.moveRadius || dist < 0.001) return;
+  const excess = dist - CFG.moveRadius;
+  const ux = dx / dist;
+  const uy = dy / dist;
+
+  if (stone.isFixed) {
+    state.body.x += ux * excess;
+    state.body.y += uy * excess;
+    state.body.vx = 0;
+    state.body.vy = 0;
+  } else {
+    stone.x -= ux * excess;
+    stone.y -= uy * excess;
+  }
+
+  state.body.x = clamp(state.body.x, wall.x + 70, wall.right - 70);
+  state.body.y = clamp(state.body.y, CFG.topY, CFG.wallHeight - 120);
+  stone.x = clamp(stone.x, wall.x + stone.r, wall.right - stone.r);
+  stone.y = clamp(stone.y, CFG.topY + 20, CFG.wallHeight - 30);
+}
+
+function ropeAnchor() {
+  return bodyPoint({ x: 0, y: -18 });
+}
+
+function ensureRopePoints() {
+  const start = ropeAnchor();
+  const end = { x: stone.x, y: stone.y };
+  if (state.ropePoints?.length === CFG.ropeSegments) return;
+  state.ropePoints = Array.from({ length: CFG.ropeSegments }, (_, index) => {
+    const t = index / (CFG.ropeSegments - 1);
+    const sag = Math.sin(Math.PI * t) * 28;
+    return {
+      x: start.x + (end.x - start.x) * t,
+      y: start.y + (end.y - start.y) * t + sag,
+      px: start.x + (end.x - start.x) * t,
+      py: start.y + (end.y - start.y) * t + sag,
+    };
+  });
+}
+
+function pinRopeEnds() {
+  const start = ropeAnchor();
+  const end = { x: stone.x, y: stone.y };
+  const first = state.ropePoints[0];
+  const last = state.ropePoints[state.ropePoints.length - 1];
+  first.x = start.x;
+  first.y = start.y;
+  last.x = end.x;
+  last.y = end.y;
+}
+
+function updateRope(dt) {
+  ensureRopePoints();
+  const points = state.ropePoints;
+  const segmentLength = CFG.moveRadius / (CFG.ropeSegments - 1);
+  pinRopeEnds();
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const point = points[i];
+    const vx = (point.x - point.px) * CFG.ropeDamping;
+    const vy = (point.y - point.py) * CFG.ropeDamping;
+    point.px = point.x;
+    point.py = point.y;
+    point.x += vx;
+    point.y += vy + CFG.ropeGravity * dt * dt;
+  }
+
+  for (let iteration = 0; iteration < CFG.ropeConstraintIterations; iteration++) {
+    pinRopeEnds();
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dist = Math.hypot(dx, dy) || 0.001;
+      const diff = (dist - segmentLength) / dist;
+      const offsetX = dx * diff * 0.5;
+      const offsetY = dy * diff * 0.5;
+      if (i !== 0) {
+        a.x += offsetX;
+        a.y += offsetY;
+      }
+      if (i + 1 !== points.length - 1) {
+        b.x -= offsetX;
+        b.y -= offsetY;
+      }
+    }
+  }
+  smoothRopeKinks();
+  pinRopeEnds();
+}
+
+function smoothRopeKinks() {
+  const points = state.ropePoints;
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1];
+    const point = points[i];
+    const next = points[i + 1];
+    const avgX = (prev.x + next.x) / 2;
+    const avgY = (prev.y + next.y) / 2;
+    point.x += (avgX - point.x) * 0.08;
+    point.y += (avgY - point.y) * 0.08;
+  }
+}
+
 function updatePose(dt) {
   const attached = Object.values(limbs).filter((limb) => limb.attached);
   let targetBody = attached.length
@@ -595,7 +722,9 @@ function updateFatigue(dt) {
   for (const limb of Object.values(limbs)) {
     if (limb.attached) {
       const reachLoad = clamp(distance(limb, limbRoot(limb)) / limbMaxReach(limb), 0, 1.4);
-      limb.load = (1 / Math.max(attached.length, 1)) * (1.1 + reachLoad + (1 - state.stability));
+      const power = limbPower(limb);
+      limb.load = ((1 / Math.max(attached.length, 1)) * (1.1 + reachLoad + (1 - state.stability))) / power;
+      applySegmentWear(limb, reachLoad, dt);
       limb.fatigue += limb.load * dt * CFG.fatigueRate;
       if (limb.fatigue >= 1 || distance(limb, limbRoot(limb)) > limbMaxReach(limb) * 1.12) {
         detachLimb(limb, limb.fatigue >= 1 ? `${limb.label}疲劳松脱。` : `${limb.label}过度伸展松脱。`);
@@ -604,7 +733,22 @@ function updateFatigue(dt) {
       limb.load = 0;
       const recoveryBoost = attached.length < 2 ? 3.5 : 1;
       limb.fatigue = Math.max(0, limb.fatigue - CFG.fatigueRecover * recoveryBoost * dt);
+      recoverSegments(limb, dt * recoveryBoost);
     }
+  }
+}
+
+function applySegmentWear(limb, reachLoad, dt) {
+  const upperLoad = limb.load * (1.15 - reachLoad * 0.3);
+  const lowerLoad = limb.load * (0.75 + reachLoad * 0.55);
+  limb.segments.upper.condition = clamp(limb.segments.upper.condition - upperLoad * CFG.segmentWearRate * dt, 0, 1);
+  limb.segments.lower.condition = clamp(limb.segments.lower.condition - lowerLoad * CFG.segmentWearRate * dt, 0, 1);
+}
+
+function recoverSegments(limb, dt) {
+  for (const segment of Object.values(limb.segments)) {
+    const cap = segment.condition < 0.66 ? 0.72 : 1;
+    segment.condition = Math.min(cap, segment.condition + CFG.segmentRecover * dt);
   }
 }
 
@@ -646,7 +790,26 @@ function limbRootFromBody(limb, body) {
 
 function limbMaxReach(limb) {
   const reserve = 1;
-  return Math.max(20, limb.upper + limb.lower - reserve);
+  return Math.max(20, (limb.upper + limb.lower - reserve) * (0.82 + limbPower(limb) * 0.18));
+}
+
+function limbPower(limb) {
+  const condition = Math.min(limb.segments.upper.condition, limb.segments.lower.condition);
+  if (condition > 0.66) return 1;
+  if (condition > 0.33) return 0.75;
+  return 0.45;
+}
+
+function segmentColor(limb, segmentKey) {
+  const condition = limb.segments[segmentKey].condition;
+  if (condition > 0.66) return limb.attached ? limb.color : "#8a9397";
+  if (condition > 0.33) return "#e0b44d";
+  return "#ef6960";
+}
+
+function segmentLabel(limb, segmentKey) {
+  if (limb.joint === "elbow") return segmentKey === "upper" ? `${limb.label}上臂` : `${limb.label}前臂`;
+  return segmentKey === "upper" ? `${limb.label}大腿` : `${limb.label}小腿`;
 }
 
 function solveLimbIK(limb) {
@@ -838,16 +1001,61 @@ function pickSupplyFromPointer(event) {
 
 function supplyUsePoint(supply) {
   if (supply.useTarget === "mouth") return bodyPoint({ x: 0, y: -72 });
-  const injured = Object.values(limbs).sort((a, b) => b.fatigue - a.fatigue)[0];
-  if (injured && injured.fatigue > 0.12) {
-    return { x: injured.x, y: injured.y };
-  }
+  const injured = mostInjuredSegment();
+  if (injured) return injured.mid;
   return bodyPoint({ x: 0, y: 0 });
+}
+
+function limbSegments(limb) {
+  return [
+    {
+      limb,
+      key: "upper",
+      condition: limb.segments.upper.condition,
+      start: { x: limb.rootX, y: limb.rootY },
+      end: { x: limb.jointX, y: limb.jointY },
+      mid: { x: (limb.rootX + limb.jointX) / 2, y: (limb.rootY + limb.jointY) / 2 },
+    },
+    {
+      limb,
+      key: "lower",
+      condition: limb.segments.lower.condition,
+      start: { x: limb.jointX, y: limb.jointY },
+      end: { x: limb.x, y: limb.y },
+      mid: { x: (limb.jointX + limb.x) / 2, y: (limb.jointY + limb.y) / 2 },
+    },
+  ];
+}
+
+function allBodySegments() {
+  return Object.values(limbs).flatMap((limb) => limbSegments(limb));
+}
+
+function mostInjuredSegment() {
+  return allBodySegments()
+    .filter((segment) => segment.condition < 0.85)
+    .sort((a, b) => a.condition - b.condition)[0] || null;
+}
+
+function nearestInjuredSegment(point) {
+  return allBodySegments()
+    .filter((segment) => segment.condition < 0.85)
+    .map((segment) => ({ ...segment, d: distance(point, segment.mid) }))
+    .filter((segment) => segment.d <= 38)
+    .sort((a, b) => a.d - b.d || a.condition - b.condition)[0] || null;
 }
 
 function tryUseHeldSupply(limb) {
   const supply = limb.heldSupply;
   if (!supply) return;
+  if (supply.id === "bandage") {
+    if (!nearestInjuredSegment(limb)) {
+      say("绷带还没送到受伤部位。");
+      return;
+    }
+    useHeldSupply(limb);
+    return;
+  }
   const target = supplyUsePoint(supply);
   if (distance(limb, target) > 34) {
     say(`${supply.label}还没送到可使用位置。`);
@@ -864,8 +1072,16 @@ function useHeldSupply(limb) {
   } else if (supply.id === "biscuit") {
     for (const item of Object.values(limbs)) item.fatigue = Math.max(0, item.fatigue - 0.16);
   } else if (supply.id === "bandage") {
-    const injured = Object.values(limbs).sort((a, b) => b.fatigue - a.fatigue)[0];
-    if (injured) injured.fatigue = Math.max(0, injured.fatigue - 0.42);
+    const injured = nearestInjuredSegment(limb);
+    if (!injured) {
+      say("绷带还没对准受伤部位。");
+      return;
+    }
+    injured.limb.segments[injured.key].condition = Math.min(0.85, injured.limb.segments[injured.key].condition + 0.45);
+    injured.limb.fatigue = Math.max(0, injured.limb.fatigue - 0.18);
+    say(`${limb.label}包扎了${segmentLabel(injured.limb, injured.key)}。`);
+    limb.heldSupply = null;
+    return;
   }
   say(`${limb.label}使用了${supply.label}。`);
   limb.heldSupply = null;
@@ -933,6 +1149,17 @@ function capturePoseSnapshot() {
         rootToEnd: roundNumber(rootToEnd),
         maxReach: roundNumber(reach),
         reachRatio: roundNumber(rootToEnd / reach),
+        power: roundNumber(limbPower(limb)),
+        segments: {
+          upper: {
+            label: segmentLabel(limb, "upper"),
+            condition: roundNumber(limb.segments.upper.condition),
+          },
+          lower: {
+            label: segmentLabel(limb, "lower"),
+            condition: roundNumber(limb.segments.lower.condition),
+          },
+        },
         segmentLengths: {
           upper: roundNumber(upper),
           lower: roundNumber(lower),
@@ -1069,6 +1296,7 @@ function resetGame() {
   state.supplyPickerOpen = false;
   state.supplyPromptLimb = null;
   state.bodyExtensionTarget = null;
+  state.ropePoints = null;
   stone.x = state.body.x + 110;
   stone.y = state.body.y - 40;
   stone.isFixed = false;
@@ -1085,6 +1313,7 @@ function resetGame() {
     limb.attached = false;
     limb.target = null;
     limb.heldSupply = null;
+    limb.segments = createSegments();
     limb.grip = 1;
     limb.fatigue = 0;
   }
@@ -1098,6 +1327,7 @@ function draw() {
   ctx.translate(0, -state.cameraY);
   drawWall();
   drawHolds();
+  drawRope();
   drawStone();
   drawClimber();
   ctx.restore();
@@ -1186,6 +1416,39 @@ function drawStone() {
   if (state.supplyPickerOpen) {
     drawSupplyPicker();
   }
+}
+
+function drawRope() {
+  ensureRopePoints();
+  pinRopeEnds();
+  const points = state.ropePoints;
+  const anchor = points[0];
+  const end = points[points.length - 1];
+  const dist = Math.hypot(end.x - anchor.x, end.y - anchor.y);
+  const tension = clamp(dist / CFG.moveRadius, 0, 1);
+  ctx.save();
+  ctx.strokeStyle = tension > 0.92 ? "#f2cf75" : "rgba(216,226,228,0.72)";
+  ctx.lineWidth = 2 + tension * 2;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length - 1; i++) {
+    const midX = (points[i].x + points[i + 1].x) / 2;
+    const midY = (points[i].y + points[i + 1].y) / 2;
+    ctx.quadraticCurveTo(points[i].x, points[i].y, midX, midY);
+  }
+  ctx.lineTo(end.x, end.y);
+  ctx.stroke();
+  ctx.fillStyle = "#d8e2e4";
+  ctx.beginPath();
+  ctx.arc(anchor.x, anchor.y, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(end.x, end.y, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
 }
 
 function drawRobotPrompt(x, y) {
@@ -1293,13 +1556,17 @@ function drawClimber() {
 
   for (const limb of Object.values(limbs)) {
     solveLimbIK(limb);
-    ctx.strokeStyle = limb.attached ? limb.color : "#8a9397";
     ctx.lineWidth = limb.id.includes("Hand") ? 6 : 7;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    ctx.strokeStyle = segmentColor(limb, "upper");
     ctx.beginPath();
     ctx.moveTo(limb.rootX, limb.rootY);
     ctx.lineTo(limb.jointX, limb.jointY);
+    ctx.stroke();
+    ctx.strokeStyle = segmentColor(limb, "lower");
+    ctx.beginPath();
+    ctx.moveTo(limb.jointX, limb.jointY);
     ctx.lineTo(limb.x, limb.y);
     ctx.stroke();
     ctx.fillStyle = "#1b2023";
@@ -1345,8 +1612,24 @@ function drawClimber() {
 }
 
 function drawSupplyUseTarget(supply) {
-  const target = supplyUsePoint(supply);
   const holder = Object.values(limbs).find((limb) => limb.heldSupply === supply);
+  if (supply.id === "bandage") {
+    const injured = allBodySegments().filter((segment) => segment.condition < 0.85);
+    for (const segment of injured) {
+      drawSupplyTargetCircle(supply, segment.mid);
+    }
+    const near = holder ? nearestInjuredSegment(holder) : null;
+    if (holder && near) drawSupplyPrompt(`按 F 包扎${segmentLabel(near.limb, near.key)}`, near.mid);
+    return;
+  }
+  const target = supplyUsePoint(supply);
+  drawSupplyTargetCircle(supply, target);
+  if (holder && distance(holder, target) <= 34) {
+    drawSupplyPrompt(`按 F 使用${supply.label}`, target);
+  }
+}
+
+function drawSupplyTargetCircle(supply, target) {
   ctx.strokeStyle = supply.color;
   ctx.fillStyle = "rgba(255,255,255,0.12)";
   ctx.lineWidth = 2;
@@ -1356,21 +1639,21 @@ function drawSupplyUseTarget(supply) {
   ctx.fill();
   ctx.stroke();
   ctx.setLineDash([]);
-  if (holder && distance(holder, target) <= 34) {
-    ctx.fillStyle = "rgba(16,20,22,0.86)";
-    ctx.strokeStyle = "rgba(255,255,255,0.22)";
-    const text = `按 F 使用${supply.label}`;
-    ctx.font = "13px Segoe UI, sans-serif";
-    const w = ctx.measureText(text).width + 22;
-    ctx.beginPath();
-    ctx.roundRect(target.x - w / 2, target.y - 48, w, 28, 8);
-    ctx.fill();
-    ctx.stroke();
-    ctx.fillStyle = "#ffffff";
-    ctx.textAlign = "center";
-    ctx.fillText(text, target.x, target.y - 29);
-    ctx.textAlign = "left";
-  }
+}
+
+function drawSupplyPrompt(text, target) {
+  ctx.fillStyle = "rgba(16,20,22,0.86)";
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.font = "13px Segoe UI, sans-serif";
+  const w = ctx.measureText(text).width + 22;
+  ctx.beginPath();
+  ctx.roundRect(target.x - w / 2, target.y - 48, w, 28, 8);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.fillText(text, target.x, target.y - 29);
+  ctx.textAlign = "left";
 }
 
 function drawStabilityGuide(attached) {

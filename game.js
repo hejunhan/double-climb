@@ -1,3 +1,9 @@
+// File layout:
+// 1. DOM/config/state
+// 2. Map editor and map loading
+// 3. Game loop, networking, physics and IK
+// 4. Supplies, snapshots and controls
+// 5. Rendering and UI helpers
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 
@@ -13,7 +19,20 @@ const ui = {
   playerRole: document.getElementById("playerRole"),
   createRoom: document.getElementById("createRoom"),
   joinRoom: document.getElementById("joinRoom"),
+  gameShell: document.getElementById("gameShell"),
+  editorShell: document.getElementById("editorShell"),
+  showGame: document.getElementById("showGame"),
+  showEditor: document.getElementById("showEditor"),
+  editorCanvas: document.getElementById("mapEditor"),
+  mapWidth: document.getElementById("mapWidth"),
+  mapHeight: document.getElementById("mapHeight"),
+  saveMap: document.getElementById("saveMap"),
+  loadMap: document.getElementById("loadMap"),
+  clearMap: document.getElementById("clearMap"),
+  palette: document.getElementById("palette"),
 };
+
+const editorCtx = ui.editorCanvas?.getContext("2d");
 
 const CFG = {
   wallWidth: 520,
@@ -27,7 +46,6 @@ const CFG = {
   stoneMaxLoadTime: 4,
   stoneRecover: 1,
   gripRadius: 34,
-  maxReach: 150,
   moveRadius: 260,
   footMaxLift: 18,
   bodyFootLiftAllowance: 70,
@@ -59,7 +77,6 @@ const limbDefs = [
 const state = {
   cameraY: 1180,
   selected: "leftHand",
-  dragging: false,
   won: false,
   messageTimer: 0,
   stability: 1,
@@ -94,14 +111,34 @@ const gaps = [
   { y: 515, h: 260, name: "顶部缺口" },
 ];
 
-const roughPatches = [
+let roughPatches = [
   { x: wall.x + 62, y: 1740, w: 170, h: 130, grip: 0.62 },
   { x: wall.x + 290, y: 1370, w: 160, h: 150, grip: 0.58 },
   { x: wall.x + 74, y: 760, w: 150, h: 140, grip: 0.6 },
   { x: wall.x + 300, y: 300, w: 150, h: 130, grip: 0.56 },
 ];
 
-const holds = buildHolds();
+const MAP_STORAGE_KEY = "double-climb-custom-map";
+const MAP_SCALE = CFG.wallWidth / 520;
+const climberMaxHeight = 46 + 23 + Math.max(...limbDefs.filter((limb) => limb.joint === "elbow").map((limb) => limb.upper + limb.lower)) + Math.max(...limbDefs.filter((limb) => limb.joint === "knee").map((limb) => limb.upper + limb.lower));
+const mapAssets = [
+  { id: "hold-small", label: "小抓点", category: "grip", radius: 12, grip: 1, color: "#a86e4b" },
+  { id: "hold-large", label: "大突起", category: "grip", radius: 20, grip: 1.1, color: "#c08355" },
+  { id: "hold-crimp", label: "薄边", category: "grip", radius: 10, grip: 0.86, color: "#b07a63" },
+  { id: "rough", label: "粗糙面", category: "grip", w: 120, h: 80, grip: 0.62, color: "#8ea789" },
+  { id: "herb", label: "草药", category: "decor", radius: 14, color: "#6fcf83" },
+  { id: "flower", label: "小花", category: "decor", radius: 13, color: "#ef8fc4" },
+  { id: "moss", label: "苔藓", category: "decor", w: 90, h: 48, color: "#709f68" },
+  { id: "crack", label: "裂纹", category: "decor", w: 86, h: 52, color: "#1b2023" },
+];
+const savedEditorMap = loadSavedMap();
+let editorMap = savedEditorMap || createEmptyMap();
+const savedMapPlayable = savedEditorMap?.items?.filter((item) => isHoldAsset(mapAsset(item.assetId))).length >= 4;
+const initialCustomMap = savedMapPlayable ? applyCustomMap(savedEditorMap) : null;
+let mapDecorations = initialCustomMap?.decorations || [];
+let holds = initialCustomMap?.holds?.length ? initialCustomMap.holds : buildHolds();
+if (initialCustomMap?.roughPatches) roughPatches = initialCustomMap.roughPatches;
+let selectedAssetId = mapAssets[0].id;
 
 function defaultSupplies() {
   return [
@@ -165,6 +202,7 @@ ui.limbPanel.innerHTML = limbDefs
   )
   .join("");
 
+setupMapEditor();
 attachInitialLimbs();
 let lastTime = performance.now();
 requestAnimationFrame(loop);
@@ -232,11 +270,11 @@ canvas.addEventListener("pointermove", (event) => {
   setLimbTargetFromPointer(event);
 });
 
-window.addEventListener("pointerup", () => {
-  state.dragging = false;
-});
-
 function buildHolds() {
+  const custom = loadSavedMap();
+  if (custom?.items?.filter((item) => isHoldAsset(mapAsset(item.assetId))).length >= 4) {
+    return applyCustomMap(custom).holds;
+  }
   const items = [];
   let i = 0;
   for (let y = 2050; y > 180; y -= 105) {
@@ -256,6 +294,247 @@ function buildHolds() {
     }
   }
   return items;
+}
+
+function setupMapEditor() {
+  if (!ui.editorCanvas || !editorCtx) return;
+  ui.mapWidth.value = Math.round(editorMap.width);
+  ui.mapHeight.value = Math.round(editorMap.height);
+  renderPalette();
+  resizeEditorCanvas();
+  drawEditor();
+
+  ui.showGame.addEventListener("click", () => setMode("game"));
+  ui.showEditor.addEventListener("click", () => setMode("editor"));
+  ui.mapWidth.addEventListener("change", updateEditorSize);
+  ui.mapHeight.addEventListener("change", updateEditorSize);
+  ui.saveMap.addEventListener("click", saveCurrentMap);
+  ui.loadMap.addEventListener("click", () => {
+    editorMap = loadSavedMap() || createEmptyMap();
+    ui.mapWidth.value = Math.round(editorMap.width);
+    ui.mapHeight.value = Math.round(editorMap.height);
+    resizeEditorCanvas();
+    drawEditor();
+  });
+  ui.clearMap.addEventListener("click", () => {
+    editorMap.items = [];
+    drawEditor();
+  });
+  ui.editorCanvas.addEventListener("click", (event) => {
+    const rect = ui.editorCanvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * (ui.editorCanvas.width / rect.width);
+    const y = (event.clientY - rect.top) * (ui.editorCanvas.height / rect.height);
+    editorMap.items.push({ assetId: selectedAssetId, x, y });
+    drawEditor();
+  });
+}
+
+function setMode(mode) {
+  const editing = mode === "editor";
+  ui.editorShell.classList.toggle("hidden", !editing);
+  ui.gameShell.classList.toggle("hidden", editing);
+  ui.showEditor.classList.toggle("active", editing);
+  ui.showGame.classList.toggle("active", !editing);
+  if (editing) drawEditor();
+}
+
+function updateEditorSize() {
+  const nextWidth = clamp(Number(ui.mapWidth.value) || 520, 360, 900);
+  const nextHeight = clamp(Number(ui.mapHeight.value) || CFG.wallHeight, 900, 3200);
+  const scaleX = nextWidth / editorMap.width;
+  const scaleY = nextHeight / editorMap.height;
+  editorMap.items = editorMap.items.map((item) => ({ ...item, x: item.x * scaleX, y: item.y * scaleY }));
+  editorMap.width = nextWidth;
+  editorMap.height = nextHeight;
+  ui.mapWidth.value = Math.round(nextWidth);
+  ui.mapHeight.value = Math.round(nextHeight);
+  resizeEditorCanvas();
+  drawEditor();
+}
+
+function resizeEditorCanvas() {
+  ui.editorCanvas.width = Math.round(editorMap.width);
+  ui.editorCanvas.height = Math.round(editorMap.height);
+}
+
+function renderPalette() {
+  ui.palette.innerHTML = "";
+  for (const asset of mapAssets) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `asset-button${asset.id === selectedAssetId ? " active" : ""}`;
+    button.dataset.asset = asset.id;
+    button.innerHTML = `<span class="asset-swatch" style="background:${asset.color}"></span><span>${asset.label}</span>`;
+    button.addEventListener("click", () => {
+      selectedAssetId = asset.id;
+      renderPalette();
+    });
+    ui.palette.appendChild(button);
+  }
+}
+
+function drawEditor() {
+  if (!editorCtx) return;
+  editorCtx.clearRect(0, 0, ui.editorCanvas.width, ui.editorCanvas.height);
+  editorCtx.fillStyle = "#262b2d";
+  editorCtx.fillRect(0, 0, ui.editorCanvas.width, ui.editorCanvas.height);
+  drawEditorReferenceLines();
+  for (const item of editorMap.items) {
+    const asset = mapAsset(item.assetId);
+    if (asset) drawMapAsset(editorCtx, asset, item.x, item.y, 1);
+  }
+}
+
+function drawEditorReferenceLines() {
+  editorCtx.strokeStyle = "rgba(255,255,255,0.16)";
+  editorCtx.lineWidth = 1;
+  editorCtx.font = "12px Segoe UI, sans-serif";
+  editorCtx.fillStyle = "rgba(255,255,255,0.46)";
+  for (let y = climberMaxHeight; y < editorMap.height; y += climberMaxHeight) {
+    editorCtx.beginPath();
+    editorCtx.moveTo(0, y);
+    editorCtx.lineTo(editorMap.width, y);
+    editorCtx.stroke();
+    editorCtx.fillText(`${Math.round(y)}`, 8, y - 6);
+  }
+}
+
+function drawMapAsset(targetCtx, asset, x, y, scale = 1) {
+  targetCtx.save();
+  targetCtx.fillStyle = asset.color;
+  targetCtx.strokeStyle = "rgba(255,255,255,0.5)";
+  targetCtx.lineWidth = 2;
+  if (asset.id === "rough" || asset.id === "moss") {
+    targetCtx.globalAlpha = asset.id === "moss" ? 0.62 : 0.32;
+    targetCtx.fillRect(x - (asset.w * scale) / 2, y - (asset.h * scale) / 2, asset.w * scale, asset.h * scale);
+    targetCtx.globalAlpha = 1;
+    targetCtx.setLineDash([4, 5]);
+    targetCtx.strokeRect(x - (asset.w * scale) / 2, y - (asset.h * scale) / 2, asset.w * scale, asset.h * scale);
+  } else if (asset.id === "crack") {
+    targetCtx.strokeStyle = asset.color;
+    targetCtx.lineWidth = 3;
+    targetCtx.beginPath();
+    targetCtx.moveTo(x - 30 * scale, y - 20 * scale);
+    targetCtx.lineTo(x - 8 * scale, y - 4 * scale);
+    targetCtx.lineTo(x - 18 * scale, y + 8 * scale);
+    targetCtx.lineTo(x + 22 * scale, y + 20 * scale);
+    targetCtx.stroke();
+  } else if (asset.id === "flower") {
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI * 2 * i) / 6;
+      targetCtx.beginPath();
+      targetCtx.ellipse(x + Math.cos(angle) * 7 * scale, y + Math.sin(angle) * 7 * scale, 5 * scale, 8 * scale, angle, 0, Math.PI * 2);
+      targetCtx.fill();
+    }
+    targetCtx.fillStyle = "#e0b44d";
+    targetCtx.beginPath();
+    targetCtx.arc(x, y, 4 * scale, 0, Math.PI * 2);
+    targetCtx.fill();
+  } else if (asset.id === "herb") {
+    targetCtx.strokeStyle = asset.color;
+    targetCtx.lineWidth = 3;
+    for (let i = -2; i <= 2; i++) {
+      targetCtx.beginPath();
+      targetCtx.moveTo(x, y + 12 * scale);
+      targetCtx.lineTo(x + i * 5 * scale, y - (10 + Math.abs(i) * 2) * scale);
+      targetCtx.stroke();
+    }
+  } else {
+    targetCtx.beginPath();
+    targetCtx.ellipse(x, y, (asset.radius || 13) * 1.35 * scale, (asset.radius || 13) * scale, 0.4, 0, Math.PI * 2);
+    targetCtx.fill();
+    targetCtx.stroke();
+  }
+  targetCtx.restore();
+}
+
+function createEmptyMap() {
+  return { width: 520, height: CFG.wallHeight, items: [] };
+}
+
+function loadSavedMap() {
+  try {
+    const raw = localStorage.getItem(MAP_STORAGE_KEY);
+    if (!raw) return null;
+    const map = JSON.parse(raw);
+    if (!map || !Array.isArray(map.items)) return null;
+    return {
+      width: Number(map.width) || 520,
+      height: Number(map.height) || CFG.wallHeight,
+      items: map.items,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveCurrentMap() {
+  localStorage.setItem(MAP_STORAGE_KEY, JSON.stringify(editorMap));
+  applyEditorMapToGame();
+  say("自定义地图已保存并应用。");
+}
+
+function mapAsset(assetId) {
+  return mapAssets.find((asset) => asset.id === assetId);
+}
+
+function isHoldAsset(asset) {
+  return asset?.category === "grip" && asset.id !== "rough";
+}
+
+function mapToWorld(item, map = editorMap) {
+  return {
+    x: wall.x + item.x * MAP_SCALE,
+    y: item.y * (CFG.wallHeight / map.height),
+  };
+}
+
+function applyCustomMap(map) {
+  const nextHolds = [];
+  const nextRough = [];
+  const nextDecor = [];
+  let holdIndex = 0;
+  for (const item of map.items || []) {
+    const asset = mapAsset(item.assetId);
+    if (!asset) continue;
+    const pos = mapToWorld(item, map);
+    if (asset.category === "decor") {
+      nextDecor.push({ ...asset, x: pos.x, y: pos.y });
+      continue;
+    }
+    if (asset.id === "rough") {
+      nextRough.push({
+        x: pos.x - (asset.w * MAP_SCALE) / 2,
+        y: pos.y - (asset.h * MAP_SCALE) / 2,
+        w: asset.w * MAP_SCALE,
+        h: asset.h * MAP_SCALE,
+        grip: asset.grip,
+      });
+      continue;
+    }
+    nextHolds.push({
+      id: `m${holdIndex++}`,
+      x: pos.x,
+      y: pos.y,
+      r: asset.radius || 13,
+      grip: asset.grip || 1,
+      kind: "hold",
+      assetId: asset.id,
+    });
+  }
+  return { holds: nextHolds, roughPatches: nextRough, decorations: nextDecor };
+}
+
+function applyEditorMapToGame() {
+  const next = applyCustomMap(editorMap);
+  if (next.holds.length < 4) {
+    say("地图至少需要 4 个小抓点、大突起或薄边。");
+    return;
+  }
+  holds = next.holds;
+  roughPatches = next.roughPatches;
+  mapDecorations = next.decorations;
+  resetGame();
 }
 
 function attachInitialLimbs() {
@@ -1327,6 +1606,7 @@ function draw() {
   ctx.translate(0, -state.cameraY);
   drawWall();
   drawHolds();
+  drawMapDecorations();
   drawRope();
   drawStone();
   drawClimber();
@@ -1377,6 +1657,14 @@ function drawHolds() {
     ctx.ellipse(hold.x, hold.y, hold.r * 1.35, hold.r, Math.sin(hold.y) * 0.8, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
+  }
+}
+
+function drawMapDecorations() {
+  for (const item of mapDecorations) {
+    const dy = item.y - state.cameraY;
+    if (dy < -80 || dy > canvas.height + 80) continue;
+    drawMapAsset(ctx, item, item.x, item.y, MAP_SCALE);
   }
 }
 

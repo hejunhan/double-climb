@@ -18,6 +18,39 @@ body {
     linear-gradient(135deg, #111417 0%, #1d2225 54%, #17191c 100%);
 }
 
+button,
+input {
+  font: inherit;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.modebar {
+  width: min(1280px, 100vw);
+  margin: 0 auto;
+  padding: 14px 20px 0;
+  display: flex;
+  gap: 8px;
+}
+
+.mode-button {
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  background: #20262a;
+  color: #c8d0d2;
+  cursor: pointer;
+}
+
+.mode-button.active {
+  background: #6bd1d5;
+  color: #101214;
+  border-color: transparent;
+}
+
 .shell {
   width: min(1280px, 100vw);
   min-height: 100vh;
@@ -34,7 +67,7 @@ body {
   place-items: center;
 }
 
-canvas {
+#game {
   width: 100%;
   max-width: 960px;
   aspect-ratio: 4 / 3;
@@ -259,6 +292,119 @@ kbd {
   border: 1px solid #485158;
   color: #f7fbfc;
   font-size: 12px;
+}
+
+.editor-shell {
+  width: min(1280px, 100vw);
+  min-height: calc(100vh - 48px);
+  margin: 0 auto;
+  padding: 16px 20px 20px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 12px;
+}
+
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-height: 48px;
+  padding: 10px;
+  background: rgba(18, 21, 23, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+}
+
+.editor-toolbar div {
+  display: grid;
+  gap: 2px;
+  margin-right: auto;
+}
+
+.editor-toolbar span,
+.editor-toolbar label {
+  color: #a9b4b7;
+  font-size: 13px;
+}
+
+.editor-toolbar input {
+  width: 82px;
+  height: 30px;
+  margin-left: 4px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: #20262a;
+  color: #ecf0f1;
+}
+
+.editor-toolbar button {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 6px;
+  background: #20262a;
+  color: #ecf0f1;
+  cursor: pointer;
+}
+
+.editor-stage {
+  min-height: 420px;
+  overflow: auto;
+  resize: both;
+  padding: 18px;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+}
+
+#mapEditor {
+  display: block;
+  width: auto;
+  max-width: none;
+  height: auto;
+  aspect-ratio: auto;
+  background: #262b2d;
+  box-shadow: none;
+  cursor: crosshair;
+}
+
+.palette {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+  padding: 10px;
+  background: rgba(18, 21, 23, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+}
+
+.asset-button {
+  min-height: 56px;
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.055);
+  color: #ecf0f1;
+  cursor: pointer;
+  text-align: left;
+}
+
+.asset-button.active {
+  border-color: #6bd1d5;
+  background: rgba(107, 209, 213, 0.16);
+}
+
+.asset-swatch {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.42);
 }
 
 @media (max-width: 920px) {

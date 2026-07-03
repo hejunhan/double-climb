@@ -7,7 +7,11 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <main class="shell">
+    <nav class="modebar">
+      <button id="showGame" class="mode-button active" type="button">游戏</button>
+      <button id="showEditor" class="mode-button" type="button">地图制作</button>
+    </nav>
+    <main class="shell" id="gameShell">
       <section class="game">
         <canvas id="game" width="960" height="720" aria-label="双人合作攀岩 Canvas"></canvas>
       </section>
@@ -23,7 +27,7 @@
             <strong id="heightText">-</strong>
           </div>
           <div>
-            <span>石头承重</span>
+            <span>机器人承重</span>
             <strong id="stoneText">-</strong>
           </div>
         </div>
@@ -46,7 +50,7 @@
               <input id="roomCode" type="text" maxlength="6" placeholder="房间码" />
               <button id="joinRoom" type="button">加入</button>
             </div>
-            <div class="net-role" id="roleText">房主控制攀岩者，加入者控制石头。</div>
+            <div class="net-role" id="roleText">房主控制攀岩者，加入者控制攀岩机器人。</div>
           </div>
         </details>
         <div id="message" class="message">选择一个肢体开始攀爬。</div>
@@ -56,15 +60,32 @@
           </summary>
           <div class="controls">
             <h2>攀岩者</h2>
-            <p>按 <kbd>Q</kbd><kbd>E</kbd><kbd>A</kbd><kbd>D</kbd> 选择左手、右手、左脚、右脚。选中后肢体跟随鼠标，点击墙面或石头手动固定。</p>
-            <h2>石头</h2>
-            <p><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> 移动伙伴石头，<kbd>Space</kbd> 固定或解除。石头只能在攀岩者附近移动。</p>
+            <p>按 <kbd>Q</kbd><kbd>E</kbd><kbd>A</kbd><kbd>D</kbd> 选择左手、右手、左脚、右脚。选中后肢体跟随鼠标，点击墙面或攀岩机器人手动固定。</p>
+            <h2>攀岩机器人</h2>
+            <p><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> 移动伙伴机器人，<kbd>Space</kbd> 固定或解除。机器人只能在攀岩者附近移动。</p>
             <h2>规则</h2>
-            <p>缺口区域没有天然抓点，需要石头临时承重。明显突起抓力高，粗糙墙面中等，平滑墙面抓力低。</p>
+            <p>缺口区域没有天然抓点，需要攀岩机器人临时承重。明显突起抓力高，粗糙墙面中等，平滑墙面抓力低。</p>
           </div>
         </details>
       </aside>
     </main>
+    <section class="editor-shell hidden" id="editorShell">
+      <header class="editor-toolbar">
+        <div>
+          <strong>地图制作</strong>
+          <span>点击底部素材后，在编辑区点击放置。横线间距为人物最大伸展高度。</span>
+        </div>
+        <label>宽 <input id="mapWidth" type="number" min="360" max="900" step="20" value="520" /></label>
+        <label>高 <input id="mapHeight" type="number" min="900" max="3200" step="100" value="2300" /></label>
+        <button id="loadMap" type="button">载入</button>
+        <button id="saveMap" type="button">保存并用于游戏</button>
+        <button id="clearMap" type="button">清空</button>
+      </header>
+      <div class="editor-stage">
+        <canvas id="mapEditor" width="520" height="2300" aria-label="地图编辑器"></canvas>
+      </div>
+      <div class="palette" id="palette" aria-label="地图素材"></div>
+    </section>
     <script src="game.js"></script>
   </body>
 </html>

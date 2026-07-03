@@ -5,6 +5,7 @@ const path = require("path");
 
 const PORT = Number(process.env.PORT || 5177);
 const ROOT = __dirname;
+const ROOT_WITH_SEP = `${path.resolve(ROOT)}${path.sep}`;
 const rooms = new Map();
 
 const MIME = {
@@ -16,8 +17,8 @@ const MIME = {
 
 const server = http.createServer((req, res) => {
   const urlPath = decodeURIComponent(new URL(req.url, `http://${req.headers.host}`).pathname);
-  const filePath = path.join(ROOT, urlPath === "/" ? "index.html" : urlPath);
-  if (!filePath.startsWith(ROOT)) {
+  const filePath = path.resolve(ROOT, `.${urlPath === "/" ? "/index.html" : urlPath}`);
+  if (filePath !== path.resolve(ROOT) && !filePath.startsWith(ROOT_WITH_SEP)) {
     res.writeHead(403);
     res.end("Forbidden");
     return;

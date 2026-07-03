@@ -27,6 +27,10 @@ const CFG = {
   gripRadius: 34,
   maxReach: 150,
   moveRadius: 260,
+  footMaxLift: 18,
+  bodyFootLiftAllowance: 70,
+  bodyMinFootReach: 64,
+  bodyExtensionMax: 95,
   bodyRadius: 30,
   topY: 130,
 };
@@ -56,9 +60,11 @@ const state = {
   stabilityInfo: null,
   body: { x: wall.x + CFG.wallWidth / 2, y: 1880, vx: 0, vy: 0, angle: 0 },
   limbTarget: null,
+  bodyExtensionTarget: null,
   targetLocked: false,
   lastPointer: null,
   ignorePointerUntilMove: false,
+  pointerIgnoreOrigin: null,
   keys: new Set(),
 };
 
@@ -159,12 +165,13 @@ window.addEventListener("keydown", (event) => {
   const def = limbDefs.find((item) => item.key === key);
   if (def) {
     if (NET.role === "guest") {
-      state.selected = def.id;
+      selectLimb(def.id);
       sendGuestInput({ kind: "climber", action: "select", limbId: def.id });
     } else {
       selectLimb(def.id);
     }
   }
+  if (key === "f") capturePoseSnapshot();
   if (key === "r" && NET.role !== "guest") resetGame();
 });
 
@@ -482,12 +489,28 @@ function constrainStoneNearBody() {
 
 function updatePose(dt) {
   const attached = Object.values(limbs).filter((limb) => limb.attached);
-  const targetBody = attached.length
+  let targetBody = attached.length
     ? averagePoint(attached.map((limb) => ({
         x: limb.x - limb.rest.x * 0.62,
         y: limb.y - limb.rest.y * 0.62,
       })))
     : { x: state.body.x, y: state.body.y + 120 };
+  if (state.bodyExtensionTarget) {
+    const extension = state.bodyExtensionTarget;
+    if (!canBodyMoveTo({ ...state.body, x: extension.x, y: extension.y }, extension.limb)) {
+      state.bodyExtensionTarget = null;
+    } else {
+    const weight = Math.min(0.78, extension.weight);
+    targetBody = {
+      x: targetBody.x + (extension.x - targetBody.x) * weight,
+      y: extension.y < targetBody.y
+        ? Math.min(targetBody.y, extension.y)
+        : targetBody.y + (extension.y - targetBody.y) * weight,
+    };
+    state.bodyExtensionTarget.weight *= Math.pow(0.55, dt);
+    if (state.bodyExtensionTarget.weight < 0.02) state.bodyExtensionTarget = null;
+    }
+  }
 
   const com = getCenterOfMass();
   const supportMinX = attached.length ? Math.min(...attached.map((limb) => limb.x)) : state.body.x;
@@ -511,8 +534,9 @@ function updatePose(dt) {
   };
 
   if (attached.length >= 2) {
-    state.body.x += (targetBody.x - state.body.x) * CFG.bodyFollow * dt;
-    state.body.y += (targetBody.y - state.body.y) * CFG.bodyFollow * dt;
+    const follow = CFG.bodyFollow * (state.bodyExtensionTarget ? 1.8 : 1);
+    state.body.x += (targetBody.x - state.body.x) * follow * dt;
+    state.body.y += (targetBody.y - state.body.y) * follow * dt;
     state.body.vy = 0;
   }
 
@@ -571,11 +595,15 @@ function updateCamera(dt) {
 }
 
 function bodyPoint(offset) {
-  const cos = Math.cos(state.body.angle);
-  const sin = Math.sin(state.body.angle);
+  return bodyPointFrom(state.body, offset);
+}
+
+function bodyPointFrom(body, offset) {
+  const cos = Math.cos(body.angle);
+  const sin = Math.sin(body.angle);
   return {
-    x: state.body.x + offset.x * cos - offset.y * sin,
-    y: state.body.y + offset.x * sin + offset.y * cos,
+    x: body.x + offset.x * cos - offset.y * sin,
+    y: body.y + offset.x * sin + offset.y * cos,
   };
 }
 
@@ -583,8 +611,12 @@ function limbRoot(limb) {
   return bodyPoint(limb.root);
 }
 
+function limbRootFromBody(limb, body) {
+  return bodyPointFrom(body, limb.root);
+}
+
 function limbMaxReach(limb) {
-  const reserve = limb.joint === "elbow" ? 2 : 6;
+  const reserve = 1;
   return Math.max(20, limb.upper + limb.lower - reserve);
 }
 
@@ -611,9 +643,12 @@ function solveLimbIK(limb) {
 
   const a = limb.upper;
   const b = limb.lower;
-  const almostStraight = limb.joint === "elbow" && dist >= a + b - 8;
+  const straightStart = Math.max(20, a + b - 18);
+  const straightEnd = a + b - 1;
+  const straightT = clamp((dist - straightStart) / (straightEnd - straightStart), 0, 1);
+  const straightEase = straightT * straightT * (3 - 2 * straightT);
   const along = clamp((a * a - b * b + dist * dist) / (2 * dist), 0, a);
-  const height = almostStraight ? 0 : Math.sqrt(Math.max(0, a * a - along * along));
+  const height = Math.sqrt(Math.max(0, a * a - along * along)) * (1 - straightEase);
   const ux = dx / dist;
   const uy = dy / dist;
   const bend = limb.bend || limb.side || 1;
@@ -626,11 +661,15 @@ function solveLimbIK(limb) {
 
 function moveSelectedLimbTo(x, y) {
   const limb = limbs[state.selected];
+  setBodyExtensionTarget(limb, x, y);
   limb.x = clamp(x, wall.x + 8, wall.right - 8);
   limb.y = clamp(y, CFG.topY, CFG.wallHeight - 20);
   limb.attached = false;
   limb.target = null;
   const root = limbRoot(limb);
+  if (limb.joint === "knee") {
+    limb.y = Math.max(limb.y, root.y - CFG.footMaxLift);
+  }
   const reach = limbMaxReach(limb);
   if (distance(limb, root) > reach) {
     const dx = limb.x - root.x;
@@ -639,7 +678,51 @@ function moveSelectedLimbTo(x, y) {
     limb.x = root.x + (dx / len) * reach;
     limb.y = root.y + (dy / len) * reach;
   }
+  if (limb.joint === "knee") {
+    limb.y = Math.max(limb.y, root.y - CFG.footMaxLift);
+  }
   solveLimbIK(limb);
+}
+
+function setBodyExtensionTarget(limb, targetX, targetY) {
+  if (!limb || limb.joint !== "elbow") return;
+  const root = limbRoot(limb);
+  const reach = limbMaxReach(limb);
+  const dx = targetX - root.x;
+  const dy = targetY - root.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= reach * 0.92) return;
+
+  const pull = Math.min(CFG.bodyExtensionMax, dist - reach * 0.82);
+  for (let scale = 1; scale >= 0.15; scale -= 0.15) {
+    const candidate = {
+      ...state.body,
+      x: clamp(state.body.x + (dx / dist) * pull * 0.45 * scale, wall.x + 70, wall.right - 70),
+      y: clamp(state.body.y + (dy / dist) * pull * scale, CFG.topY, CFG.wallHeight - 120),
+    };
+    if (!canBodyMoveTo(candidate, limb)) continue;
+    state.bodyExtensionTarget = {
+      x: candidate.x,
+      y: candidate.y,
+      limb,
+      weight: state.bodyExtensionTarget ? Math.min(0.9, state.bodyExtensionTarget.weight + 0.22) : 0.72,
+    };
+    return;
+  }
+}
+
+function canBodyMoveTo(body, movingLimb) {
+  for (const limb of Object.values(limbs)) {
+    if (limb === movingLimb || !limb.attached) continue;
+    const root = limbRootFromBody(limb, body);
+    const rootDistance = distance(limb, root);
+    if (rootDistance > limbMaxReach(limb) * 1.02) return false;
+    if (limb.joint === "knee") {
+      if (rootDistance < CFG.bodyMinFootReach) return false;
+      if (limb.y < root.y - CFG.bodyFootLiftAllowance) return false;
+    }
+  }
+  return true;
 }
 
 function tryAttachSelectedAt(x, y) {
@@ -675,6 +758,95 @@ function nearestHold(x, y) {
     .sort((a, b) => a.d - b.d)[0].item;
 }
 
+function capturePoseSnapshot() {
+  const snapshot = {
+    capturedAt: new Date().toISOString(),
+    selected: state.selected,
+    body: roundPose(state.body),
+    stability: roundNumber(state.stability),
+    stabilityInfo: state.stabilityInfo ? {
+      outside: roundNumber(state.stabilityInfo.outside),
+      stretch: roundNumber(state.stabilityInfo.stretch),
+      attachedCount: state.stabilityInfo.attachedCount,
+      supportMinX: roundNumber(state.stabilityInfo.supportMinX),
+      supportMaxX: roundNumber(state.stabilityInfo.supportMaxX),
+      com: roundPoint(state.stabilityInfo.com),
+    } : null,
+    limbTarget: state.limbTarget ? roundPoint(state.limbTarget) : null,
+    bodyExtensionTarget: state.bodyExtensionTarget ? {
+      x: roundNumber(state.bodyExtensionTarget.x),
+      y: roundNumber(state.bodyExtensionTarget.y),
+      weight: roundNumber(state.bodyExtensionTarget.weight),
+      limbId: state.bodyExtensionTarget.limb?.id || null,
+    } : null,
+    limbs: Object.fromEntries(Object.entries(limbs).map(([id, limb]) => {
+      const root = limbRoot(limb);
+      const reach = limbMaxReach(limb);
+      const rootToEnd = distance(limb, root);
+      const upper = Math.hypot(limb.jointX - root.x, limb.jointY - root.y);
+      const lower = Math.hypot(limb.x - limb.jointX, limb.y - limb.jointY);
+      return [id, {
+        label: limb.label,
+        joint: limb.joint,
+        attached: limb.attached,
+        targetId: limb.target?.id || null,
+        targetKind: limb.target?.kind || null,
+        endpoint: roundPoint(limb),
+        root: roundPoint(root),
+        jointPoint: { x: roundNumber(limb.jointX), y: roundNumber(limb.jointY) },
+        rest: roundPoint(limb.rest),
+        rootOffset: roundPoint(limb.root),
+        rootToEnd: roundNumber(rootToEnd),
+        maxReach: roundNumber(reach),
+        reachRatio: roundNumber(rootToEnd / reach),
+        segmentLengths: {
+          upper: roundNumber(upper),
+          lower: roundNumber(lower),
+        },
+        relativeToBody: {
+          endpoint: roundPoint({ x: limb.x - state.body.x, y: limb.y - state.body.y }),
+          root: roundPoint({ x: root.x - state.body.x, y: root.y - state.body.y }),
+          joint: roundPoint({ x: limb.jointX - state.body.x, y: limb.jointY - state.body.y }),
+        },
+        load: roundNumber(limb.load),
+        fatigue: roundNumber(limb.fatigue),
+        grip: roundNumber(limb.grip),
+      }];
+    })),
+  };
+  const text = JSON.stringify(snapshot, null, 2);
+  console.log("POSE_SNAPSHOT", text);
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => say("姿态数据已复制到剪贴板。"),
+      () => say("姿态数据已输出到控制台。"),
+    );
+  } else {
+    say("姿态数据已输出到控制台。");
+  }
+}
+
+function roundNumber(value) {
+  return Number.isFinite(value) ? Math.round(value * 100) / 100 : null;
+}
+
+function roundPoint(point) {
+  return {
+    x: roundNumber(point.x),
+    y: roundNumber(point.y),
+  };
+}
+
+function roundPose(body) {
+  return {
+    x: roundNumber(body.x),
+    y: roundNumber(body.y),
+    vx: roundNumber(body.vx),
+    vy: roundNumber(body.vy),
+    angle: roundNumber(body.angle),
+  };
+}
+
 function selectLimb(limbId) {
   const limb = limbs[limbId];
   if (!limb) return;
@@ -682,6 +854,7 @@ function selectLimb(limbId) {
   state.targetLocked = false;
   state.limbTarget = { x: limb.x, y: limb.y };
   state.ignorePointerUntilMove = true;
+  state.pointerIgnoreOrigin = state.lastPointer ? { ...state.lastPointer } : null;
   say(`已选择${limb.label}。`);
 }
 
@@ -690,8 +863,13 @@ function setLimbTargetFromPointer(event) {
   const pos = screenToWorld(event);
   state.lastPointer = pos;
   if (state.ignorePointerUntilMove) {
+    if (!state.pointerIgnoreOrigin) {
+      state.pointerIgnoreOrigin = pos;
+      return;
+    }
+    if (distance(pos, state.pointerIgnoreOrigin) < 10) return;
     state.ignorePointerUntilMove = false;
-    return;
+    state.pointerIgnoreOrigin = null;
   }
   state.limbTarget = { x: pos.x, y: pos.y };
   if (NET.role === "guest") {

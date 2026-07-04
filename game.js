@@ -1,3 +1,9 @@
+// File layout:
+// 1. DOM/config/state
+// 2. Map editor and map loading
+// 3. Game loop, networking, physics and IK
+// 4. Supplies, snapshots and controls
+// 5. Rendering and UI helpers
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 
@@ -13,7 +19,20 @@ const ui = {
   playerRole: document.getElementById("playerRole"),
   createRoom: document.getElementById("createRoom"),
   joinRoom: document.getElementById("joinRoom"),
+  gameShell: document.getElementById("gameShell"),
+  editorShell: document.getElementById("editorShell"),
+  showGame: document.getElementById("showGame"),
+  showEditor: document.getElementById("showEditor"),
+  editorCanvas: document.getElementById("mapEditor"),
+  mapWidth: document.getElementById("mapWidth"),
+  mapHeight: document.getElementById("mapHeight"),
+  saveMap: document.getElementById("saveMap"),
+  loadMap: document.getElementById("loadMap"),
+  clearMap: document.getElementById("clearMap"),
+  palette: document.getElementById("palette"),
 };
+
+const editorCtx = ui.editorCanvas?.getContext("2d");
 
 const CFG = {
   wallWidth: 520,
@@ -22,15 +41,20 @@ const CFG = {
   bodyFollow: 4,
   fatigueRate: 0.08,
   fatigueRecover: 0.15,
+  segmentWearRate: 0.018,
+  segmentRecover: 0.035,
   stoneMaxLoadTime: 4,
   stoneRecover: 1,
   gripRadius: 34,
-  maxReach: 150,
   moveRadius: 260,
   footMaxLift: 18,
   bodyFootLiftAllowance: 70,
   bodyMinFootReach: 64,
   bodyExtensionMax: 95,
+  ropeSegments: 13,
+  ropeGravity: 10000,
+  ropeDamping: 0.52,
+  ropeConstraintIterations: 12,
   bodyRadius: 30,
   topY: 130,
 };
@@ -53,7 +77,6 @@ const limbDefs = [
 const state = {
   cameraY: 1180,
   selected: "leftHand",
-  dragging: false,
   won: false,
   messageTimer: 0,
   stability: 1,
@@ -61,6 +84,9 @@ const state = {
   body: { x: wall.x + CFG.wallWidth / 2, y: 1880, vx: 0, vy: 0, angle: 0 },
   limbTarget: null,
   bodyExtensionTarget: null,
+  supplyPickerOpen: false,
+  supplyPromptLimb: null,
+  ropePoints: null,
   targetLocked: false,
   lastPointer: null,
   ignorePointerUntilMove: false,
@@ -85,14 +111,50 @@ const gaps = [
   { y: 515, h: 260, name: "顶部缺口" },
 ];
 
-const roughPatches = [
+let roughPatches = [
   { x: wall.x + 62, y: 1740, w: 170, h: 130, grip: 0.62 },
   { x: wall.x + 290, y: 1370, w: 160, h: 150, grip: 0.58 },
   { x: wall.x + 74, y: 760, w: 150, h: 140, grip: 0.6 },
   { x: wall.x + 300, y: 300, w: 150, h: 130, grip: 0.56 },
 ];
 
-const holds = buildHolds();
+const MAP_STORAGE_KEY = "double-climb-custom-map";
+const MAP_SCALE = CFG.wallWidth / 520;
+const climberMaxHeight = 46 + 23 + Math.max(...limbDefs.filter((limb) => limb.joint === "elbow").map((limb) => limb.upper + limb.lower)) + Math.max(...limbDefs.filter((limb) => limb.joint === "knee").map((limb) => limb.upper + limb.lower));
+const mapAssets = [
+  { id: "hold-small", label: "小抓点", category: "grip", radius: 12, grip: 1, color: "#a86e4b" },
+  { id: "hold-large", label: "大突起", category: "grip", radius: 20, grip: 1.1, color: "#c08355" },
+  { id: "hold-crimp", label: "薄边", category: "grip", radius: 10, grip: 0.86, color: "#b07a63" },
+  { id: "rough", label: "粗糙面", category: "grip", w: 120, h: 80, grip: 0.62, color: "#8ea789" },
+  { id: "herb", label: "草药", category: "decor", radius: 14, color: "#6fcf83" },
+  { id: "flower", label: "小花", category: "decor", radius: 13, color: "#ef8fc4" },
+  { id: "moss", label: "苔藓", category: "decor", w: 90, h: 48, color: "#709f68" },
+  { id: "crack", label: "裂纹", category: "decor", w: 86, h: 52, color: "#1b2023" },
+];
+const savedEditorMap = loadSavedMap();
+let editorMap = savedEditorMap || createEmptyMap();
+const savedMapPlayable = savedEditorMap?.items?.filter((item) => isHoldAsset(mapAsset(item.assetId))).length >= 4;
+const initialCustomMap = savedMapPlayable ? applyCustomMap(savedEditorMap) : null;
+let mapDecorations = initialCustomMap?.decorations || [];
+let holds = initialCustomMap?.holds?.length ? initialCustomMap.holds : buildHolds();
+if (initialCustomMap?.roughPatches) roughPatches = initialCustomMap.roughPatches;
+let selectedAssetId = mapAssets[0].id;
+
+function defaultSupplies() {
+  return [
+    { id: "water", label: "水", color: "#6bb7ff", useTarget: "mouth" },
+    { id: "biscuit", label: "压缩饼干", color: "#d6a85b", useTarget: "mouth" },
+    { id: "bandage", label: "绷带", color: "#f2f0df", useTarget: "injury" },
+  ];
+}
+
+function createSegments() {
+  return {
+    upper: { condition: 1 },
+    lower: { condition: 1 },
+  };
+}
+
 const stone = {
   x: state.body.x + 110,
   y: state.body.y - 40,
@@ -103,6 +165,7 @@ const stone = {
   shake: 0,
   grip: 0.95,
   kind: "stone",
+  supplies: defaultSupplies(),
 };
 
 const limbs = Object.fromEntries(
@@ -118,6 +181,8 @@ const limbs = Object.fromEntries(
       jointY: state.body.y + (def.root.y + def.rest.y) / 2,
       attached: false,
       target: null,
+      heldSupply: null,
+      segments: createSegments(),
       grip: 1,
       fatigue: 0,
       load: 0,
@@ -137,6 +202,7 @@ ui.limbPanel.innerHTML = limbDefs
   )
   .join("");
 
+setupMapEditor();
 attachInitialLimbs();
 let lastTime = performance.now();
 requestAnimationFrame(loop);
@@ -150,6 +216,11 @@ updateNetUi();
 
 window.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
+  if (event.ctrlKey && key === "c") {
+    event.preventDefault();
+    capturePoseSnapshot();
+    return;
+  }
   state.keys.add(key);
   if (isStoneControl(event)) {
     event.preventDefault();
@@ -171,7 +242,7 @@ window.addEventListener("keydown", (event) => {
       selectLimb(def.id);
     }
   }
-  if (key === "f") capturePoseSnapshot();
+  if (key === "f") handleSupplyKey();
   if (key === "r" && NET.role !== "guest") resetGame();
 });
 
@@ -185,19 +256,25 @@ window.addEventListener("keyup", (event) => {
 
 canvas.addEventListener("pointerdown", (event) => {
   if (!controlsClimber()) return;
+  if (state.supplyPickerOpen) {
+    pickSupplyFromPointer(event);
+    return;
+  }
+  if (limbs[state.selected]?.heldSupply) return;
   tryAttachSelectedFromPointer(event);
 });
 
 canvas.addEventListener("pointermove", (event) => {
   if (!controlsClimber()) return;
+  if (state.supplyPickerOpen) return;
   setLimbTargetFromPointer(event);
 });
 
-window.addEventListener("pointerup", () => {
-  state.dragging = false;
-});
-
 function buildHolds() {
+  const custom = loadSavedMap();
+  if (custom?.items?.filter((item) => isHoldAsset(mapAsset(item.assetId))).length >= 4) {
+    return applyCustomMap(custom).holds;
+  }
   const items = [];
   let i = 0;
   for (let y = 2050; y > 180; y -= 105) {
@@ -217,6 +294,247 @@ function buildHolds() {
     }
   }
   return items;
+}
+
+function setupMapEditor() {
+  if (!ui.editorCanvas || !editorCtx) return;
+  ui.mapWidth.value = Math.round(editorMap.width);
+  ui.mapHeight.value = Math.round(editorMap.height);
+  renderPalette();
+  resizeEditorCanvas();
+  drawEditor();
+
+  ui.showGame.addEventListener("click", () => setMode("game"));
+  ui.showEditor.addEventListener("click", () => setMode("editor"));
+  ui.mapWidth.addEventListener("change", updateEditorSize);
+  ui.mapHeight.addEventListener("change", updateEditorSize);
+  ui.saveMap.addEventListener("click", saveCurrentMap);
+  ui.loadMap.addEventListener("click", () => {
+    editorMap = loadSavedMap() || createEmptyMap();
+    ui.mapWidth.value = Math.round(editorMap.width);
+    ui.mapHeight.value = Math.round(editorMap.height);
+    resizeEditorCanvas();
+    drawEditor();
+  });
+  ui.clearMap.addEventListener("click", () => {
+    editorMap.items = [];
+    drawEditor();
+  });
+  ui.editorCanvas.addEventListener("click", (event) => {
+    const rect = ui.editorCanvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * (ui.editorCanvas.width / rect.width);
+    const y = (event.clientY - rect.top) * (ui.editorCanvas.height / rect.height);
+    editorMap.items.push({ assetId: selectedAssetId, x, y });
+    drawEditor();
+  });
+}
+
+function setMode(mode) {
+  const editing = mode === "editor";
+  ui.editorShell.classList.toggle("hidden", !editing);
+  ui.gameShell.classList.toggle("hidden", editing);
+  ui.showEditor.classList.toggle("active", editing);
+  ui.showGame.classList.toggle("active", !editing);
+  if (editing) drawEditor();
+}
+
+function updateEditorSize() {
+  const nextWidth = clamp(Number(ui.mapWidth.value) || 520, 360, 900);
+  const nextHeight = clamp(Number(ui.mapHeight.value) || CFG.wallHeight, 900, 3200);
+  const scaleX = nextWidth / editorMap.width;
+  const scaleY = nextHeight / editorMap.height;
+  editorMap.items = editorMap.items.map((item) => ({ ...item, x: item.x * scaleX, y: item.y * scaleY }));
+  editorMap.width = nextWidth;
+  editorMap.height = nextHeight;
+  ui.mapWidth.value = Math.round(nextWidth);
+  ui.mapHeight.value = Math.round(nextHeight);
+  resizeEditorCanvas();
+  drawEditor();
+}
+
+function resizeEditorCanvas() {
+  ui.editorCanvas.width = Math.round(editorMap.width);
+  ui.editorCanvas.height = Math.round(editorMap.height);
+}
+
+function renderPalette() {
+  ui.palette.innerHTML = "";
+  for (const asset of mapAssets) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `asset-button${asset.id === selectedAssetId ? " active" : ""}`;
+    button.dataset.asset = asset.id;
+    button.innerHTML = `<span class="asset-swatch" style="background:${asset.color}"></span><span>${asset.label}</span>`;
+    button.addEventListener("click", () => {
+      selectedAssetId = asset.id;
+      renderPalette();
+    });
+    ui.palette.appendChild(button);
+  }
+}
+
+function drawEditor() {
+  if (!editorCtx) return;
+  editorCtx.clearRect(0, 0, ui.editorCanvas.width, ui.editorCanvas.height);
+  editorCtx.fillStyle = "#262b2d";
+  editorCtx.fillRect(0, 0, ui.editorCanvas.width, ui.editorCanvas.height);
+  drawEditorReferenceLines();
+  for (const item of editorMap.items) {
+    const asset = mapAsset(item.assetId);
+    if (asset) drawMapAsset(editorCtx, asset, item.x, item.y, 1);
+  }
+}
+
+function drawEditorReferenceLines() {
+  editorCtx.strokeStyle = "rgba(255,255,255,0.16)";
+  editorCtx.lineWidth = 1;
+  editorCtx.font = "12px Segoe UI, sans-serif";
+  editorCtx.fillStyle = "rgba(255,255,255,0.46)";
+  for (let y = climberMaxHeight; y < editorMap.height; y += climberMaxHeight) {
+    editorCtx.beginPath();
+    editorCtx.moveTo(0, y);
+    editorCtx.lineTo(editorMap.width, y);
+    editorCtx.stroke();
+    editorCtx.fillText(`${Math.round(y)}`, 8, y - 6);
+  }
+}
+
+function drawMapAsset(targetCtx, asset, x, y, scale = 1) {
+  targetCtx.save();
+  targetCtx.fillStyle = asset.color;
+  targetCtx.strokeStyle = "rgba(255,255,255,0.5)";
+  targetCtx.lineWidth = 2;
+  if (asset.id === "rough" || asset.id === "moss") {
+    targetCtx.globalAlpha = asset.id === "moss" ? 0.62 : 0.32;
+    targetCtx.fillRect(x - (asset.w * scale) / 2, y - (asset.h * scale) / 2, asset.w * scale, asset.h * scale);
+    targetCtx.globalAlpha = 1;
+    targetCtx.setLineDash([4, 5]);
+    targetCtx.strokeRect(x - (asset.w * scale) / 2, y - (asset.h * scale) / 2, asset.w * scale, asset.h * scale);
+  } else if (asset.id === "crack") {
+    targetCtx.strokeStyle = asset.color;
+    targetCtx.lineWidth = 3;
+    targetCtx.beginPath();
+    targetCtx.moveTo(x - 30 * scale, y - 20 * scale);
+    targetCtx.lineTo(x - 8 * scale, y - 4 * scale);
+    targetCtx.lineTo(x - 18 * scale, y + 8 * scale);
+    targetCtx.lineTo(x + 22 * scale, y + 20 * scale);
+    targetCtx.stroke();
+  } else if (asset.id === "flower") {
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI * 2 * i) / 6;
+      targetCtx.beginPath();
+      targetCtx.ellipse(x + Math.cos(angle) * 7 * scale, y + Math.sin(angle) * 7 * scale, 5 * scale, 8 * scale, angle, 0, Math.PI * 2);
+      targetCtx.fill();
+    }
+    targetCtx.fillStyle = "#e0b44d";
+    targetCtx.beginPath();
+    targetCtx.arc(x, y, 4 * scale, 0, Math.PI * 2);
+    targetCtx.fill();
+  } else if (asset.id === "herb") {
+    targetCtx.strokeStyle = asset.color;
+    targetCtx.lineWidth = 3;
+    for (let i = -2; i <= 2; i++) {
+      targetCtx.beginPath();
+      targetCtx.moveTo(x, y + 12 * scale);
+      targetCtx.lineTo(x + i * 5 * scale, y - (10 + Math.abs(i) * 2) * scale);
+      targetCtx.stroke();
+    }
+  } else {
+    targetCtx.beginPath();
+    targetCtx.ellipse(x, y, (asset.radius || 13) * 1.35 * scale, (asset.radius || 13) * scale, 0.4, 0, Math.PI * 2);
+    targetCtx.fill();
+    targetCtx.stroke();
+  }
+  targetCtx.restore();
+}
+
+function createEmptyMap() {
+  return { width: 520, height: CFG.wallHeight, items: [] };
+}
+
+function loadSavedMap() {
+  try {
+    const raw = localStorage.getItem(MAP_STORAGE_KEY);
+    if (!raw) return null;
+    const map = JSON.parse(raw);
+    if (!map || !Array.isArray(map.items)) return null;
+    return {
+      width: Number(map.width) || 520,
+      height: Number(map.height) || CFG.wallHeight,
+      items: map.items,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveCurrentMap() {
+  localStorage.setItem(MAP_STORAGE_KEY, JSON.stringify(editorMap));
+  applyEditorMapToGame();
+  say("自定义地图已保存并应用。");
+}
+
+function mapAsset(assetId) {
+  return mapAssets.find((asset) => asset.id === assetId);
+}
+
+function isHoldAsset(asset) {
+  return asset?.category === "grip" && asset.id !== "rough";
+}
+
+function mapToWorld(item, map = editorMap) {
+  return {
+    x: wall.x + item.x * MAP_SCALE,
+    y: item.y * (CFG.wallHeight / map.height),
+  };
+}
+
+function applyCustomMap(map) {
+  const nextHolds = [];
+  const nextRough = [];
+  const nextDecor = [];
+  let holdIndex = 0;
+  for (const item of map.items || []) {
+    const asset = mapAsset(item.assetId);
+    if (!asset) continue;
+    const pos = mapToWorld(item, map);
+    if (asset.category === "decor") {
+      nextDecor.push({ ...asset, x: pos.x, y: pos.y });
+      continue;
+    }
+    if (asset.id === "rough") {
+      nextRough.push({
+        x: pos.x - (asset.w * MAP_SCALE) / 2,
+        y: pos.y - (asset.h * MAP_SCALE) / 2,
+        w: asset.w * MAP_SCALE,
+        h: asset.h * MAP_SCALE,
+        grip: asset.grip,
+      });
+      continue;
+    }
+    nextHolds.push({
+      id: `m${holdIndex++}`,
+      x: pos.x,
+      y: pos.y,
+      r: asset.radius || 13,
+      grip: asset.grip || 1,
+      kind: "hold",
+      assetId: asset.id,
+    });
+  }
+  return { holds: nextHolds, roughPatches: nextRough, decorations: nextDecor };
+}
+
+function applyEditorMapToGame() {
+  const next = applyCustomMap(editorMap);
+  if (next.holds.length < 4) {
+    say("地图至少需要 4 个小抓点、大突起或薄边。");
+    return;
+  }
+  holds = next.holds;
+  roughPatches = next.roughPatches;
+  mapDecorations = next.decorations;
+  resetGame();
 }
 
 function attachInitialLimbs() {
@@ -246,7 +564,10 @@ function update(dt) {
   state.messageTimer = Math.max(0, state.messageTimer - dt);
   updateClimberControl(dt);
   updateStone(dt);
+  updateSupplyPrompt();
   updatePose(dt);
+  applyRopeConstraint();
+  updateRope(dt);
   updateFatigue(dt);
   updateCamera(dt);
   if (state.body.y <= CFG.topY) {
@@ -277,7 +598,7 @@ function updateStone(dt) {
       stone.shake = 0;
     }
     if (stone.currentLoadTime >= CFG.stoneMaxLoadTime) {
-      releaseStone("石头承重过久，已经松脱。");
+      releaseStone("攀岩机器人承重过久，已经松脱。");
     }
   }
 }
@@ -455,7 +776,7 @@ function controlsStone() {
 }
 
 function roleLabel(role) {
-  return role === "stone" ? "石头" : "攀岩者";
+  return role === "stone" ? "攀岩机器人" : "攀岩者";
 }
 
 function updateNetUi() {
@@ -484,6 +805,116 @@ function constrainStoneNearBody() {
   if (Math.hypot(stone.x - state.body.x, stone.y - state.body.y) < CFG.bodyRadius + stone.r + 8) {
     stone.x += Math.sign(dx || 1) * 4;
     stone.y += Math.sign(dy || -1) * 4;
+  }
+}
+
+function applyRopeConstraint() {
+  const dx = stone.x - state.body.x;
+  const dy = stone.y - state.body.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= CFG.moveRadius || dist < 0.001) return;
+  const excess = dist - CFG.moveRadius;
+  const ux = dx / dist;
+  const uy = dy / dist;
+
+  if (stone.isFixed) {
+    state.body.x += ux * excess;
+    state.body.y += uy * excess;
+    state.body.vx = 0;
+    state.body.vy = 0;
+  } else {
+    stone.x -= ux * excess;
+    stone.y -= uy * excess;
+  }
+
+  state.body.x = clamp(state.body.x, wall.x + 70, wall.right - 70);
+  state.body.y = clamp(state.body.y, CFG.topY, CFG.wallHeight - 120);
+  stone.x = clamp(stone.x, wall.x + stone.r, wall.right - stone.r);
+  stone.y = clamp(stone.y, CFG.topY + 20, CFG.wallHeight - 30);
+}
+
+function ropeAnchor() {
+  return bodyPoint({ x: 0, y: -18 });
+}
+
+function ensureRopePoints() {
+  const start = ropeAnchor();
+  const end = { x: stone.x, y: stone.y };
+  if (state.ropePoints?.length === CFG.ropeSegments) return;
+  state.ropePoints = Array.from({ length: CFG.ropeSegments }, (_, index) => {
+    const t = index / (CFG.ropeSegments - 1);
+    const sag = Math.sin(Math.PI * t) * 28;
+    return {
+      x: start.x + (end.x - start.x) * t,
+      y: start.y + (end.y - start.y) * t + sag,
+      px: start.x + (end.x - start.x) * t,
+      py: start.y + (end.y - start.y) * t + sag,
+    };
+  });
+}
+
+function pinRopeEnds() {
+  const start = ropeAnchor();
+  const end = { x: stone.x, y: stone.y };
+  const first = state.ropePoints[0];
+  const last = state.ropePoints[state.ropePoints.length - 1];
+  first.x = start.x;
+  first.y = start.y;
+  last.x = end.x;
+  last.y = end.y;
+}
+
+function updateRope(dt) {
+  ensureRopePoints();
+  const points = state.ropePoints;
+  const segmentLength = CFG.moveRadius / (CFG.ropeSegments - 1);
+  pinRopeEnds();
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const point = points[i];
+    const vx = (point.x - point.px) * CFG.ropeDamping;
+    const vy = (point.y - point.py) * CFG.ropeDamping;
+    point.px = point.x;
+    point.py = point.y;
+    point.x += vx;
+    point.y += vy + CFG.ropeGravity * dt * dt;
+  }
+
+  for (let iteration = 0; iteration < CFG.ropeConstraintIterations; iteration++) {
+    pinRopeEnds();
+    for (let i = 0; i < points.length - 1; i++) {
+      const a = points[i];
+      const b = points[i + 1];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dist = Math.hypot(dx, dy) || 0.001;
+      const diff = (dist - segmentLength) / dist;
+      const offsetX = dx * diff * 0.5;
+      const offsetY = dy * diff * 0.5;
+      if (i !== 0) {
+        a.x += offsetX;
+        a.y += offsetY;
+      }
+      if (i + 1 !== points.length - 1) {
+        b.x -= offsetX;
+        b.y -= offsetY;
+      }
+    }
+  }
+  smoothRopeKinks();
+  pinRopeEnds();
+}
+
+function smoothRopeKinks() {
+  const points = state.ropePoints;
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1];
+    const point = points[i];
+    const next = points[i + 1];
+    const avgX = (prev.x + next.x) / 2;
+    const avgY = (prev.y + next.y) / 2;
+    point.x += (avgX - point.x) * 0.08;
+    point.y += (avgY - point.y) * 0.08;
   }
 }
 
@@ -552,6 +983,10 @@ function updatePose(dt) {
 
   for (const limb of Object.values(limbs)) {
     if (!limb.attached) {
+      if (state.supplyPickerOpen && limb.id === state.supplyPromptLimb) {
+        solveLimbIK(limb);
+        continue;
+      }
       const targetX = state.body.x + limb.rest.x;
       const targetY = state.body.y + limb.rest.y;
       limb.x += (targetX - limb.x) * 6 * dt;
@@ -566,7 +1001,9 @@ function updateFatigue(dt) {
   for (const limb of Object.values(limbs)) {
     if (limb.attached) {
       const reachLoad = clamp(distance(limb, limbRoot(limb)) / limbMaxReach(limb), 0, 1.4);
-      limb.load = (1 / Math.max(attached.length, 1)) * (1.1 + reachLoad + (1 - state.stability));
+      const power = limbPower(limb);
+      limb.load = ((1 / Math.max(attached.length, 1)) * (1.1 + reachLoad + (1 - state.stability))) / power;
+      applySegmentWear(limb, reachLoad, dt);
       limb.fatigue += limb.load * dt * CFG.fatigueRate;
       if (limb.fatigue >= 1 || distance(limb, limbRoot(limb)) > limbMaxReach(limb) * 1.12) {
         detachLimb(limb, limb.fatigue >= 1 ? `${limb.label}疲劳松脱。` : `${limb.label}过度伸展松脱。`);
@@ -575,7 +1012,22 @@ function updateFatigue(dt) {
       limb.load = 0;
       const recoveryBoost = attached.length < 2 ? 3.5 : 1;
       limb.fatigue = Math.max(0, limb.fatigue - CFG.fatigueRecover * recoveryBoost * dt);
+      recoverSegments(limb, dt * recoveryBoost);
     }
+  }
+}
+
+function applySegmentWear(limb, reachLoad, dt) {
+  const upperLoad = limb.load * (1.15 - reachLoad * 0.3);
+  const lowerLoad = limb.load * (0.75 + reachLoad * 0.55);
+  limb.segments.upper.condition = clamp(limb.segments.upper.condition - upperLoad * CFG.segmentWearRate * dt, 0, 1);
+  limb.segments.lower.condition = clamp(limb.segments.lower.condition - lowerLoad * CFG.segmentWearRate * dt, 0, 1);
+}
+
+function recoverSegments(limb, dt) {
+  for (const segment of Object.values(limb.segments)) {
+    const cap = segment.condition < 0.66 ? 0.72 : 1;
+    segment.condition = Math.min(cap, segment.condition + CFG.segmentRecover * dt);
   }
 }
 
@@ -617,7 +1069,26 @@ function limbRootFromBody(limb, body) {
 
 function limbMaxReach(limb) {
   const reserve = 1;
-  return Math.max(20, limb.upper + limb.lower - reserve);
+  return Math.max(20, (limb.upper + limb.lower - reserve) * (0.82 + limbPower(limb) * 0.18));
+}
+
+function limbPower(limb) {
+  const condition = Math.min(limb.segments.upper.condition, limb.segments.lower.condition);
+  if (condition > 0.66) return 1;
+  if (condition > 0.33) return 0.75;
+  return 0.45;
+}
+
+function segmentColor(limb, segmentKey) {
+  const condition = limb.segments[segmentKey].condition;
+  if (condition > 0.66) return limb.attached ? limb.color : "#8a9397";
+  if (condition > 0.33) return "#e0b44d";
+  return "#ef6960";
+}
+
+function segmentLabel(limb, segmentKey) {
+  if (limb.joint === "elbow") return segmentKey === "upper" ? `${limb.label}上臂` : `${limb.label}前臂`;
+  return segmentKey === "upper" ? `${limb.label}大腿` : `${limb.label}小腿`;
 }
 
 function solveLimbIK(limb) {
@@ -738,6 +1209,163 @@ function tryAttachSelectedAt(x, y) {
   say(`${limb.label}已固定，抓力 ${Math.round(target.grip * 100)}%。`);
 }
 
+function handAtRobot() {
+  return Object.values(limbs)
+    .filter((limb) => limb.joint === "elbow")
+    .find((limb) => distance(limb, stone) <= CFG.gripRadius + stone.r);
+}
+
+function updateSupplyPrompt() {
+  if (state.supplyPickerOpen) return;
+  state.supplyPromptLimb = handAtRobot()?.id || null;
+}
+
+function openSupplyPicker() {
+  updateSupplyPrompt();
+  if (!state.supplyPromptLimb) return;
+  if (!stone.supplies.length) {
+    say("攀岩机器人没有剩余物资。");
+    return;
+  }
+  state.supplyPickerOpen = true;
+  state.limbTarget = null;
+  state.targetLocked = true;
+  say("选择要拿取的物资。");
+}
+
+function handleSupplyKey() {
+  const carrying = Object.values(limbs).find((limb) => limb.heldSupply);
+  if (carrying) {
+    tryUseHeldSupply(carrying);
+    return;
+  }
+  openSupplyPicker();
+}
+
+function supplySlots() {
+  const slotSize = 34;
+  const gap = 8;
+  const total = stone.supplies.length * slotSize + Math.max(0, stone.supplies.length - 1) * gap;
+  const startX = stone.x - total / 2;
+  const y = stone.y - stone.r - 54;
+  return stone.supplies.map((supply, index) => ({
+    supply,
+    x: startX + index * (slotSize + gap),
+    y,
+    w: slotSize,
+    h: slotSize,
+  }));
+}
+
+function pickSupplyFromPointer(event) {
+  const pos = screenToWorld(event);
+  const slot = supplySlots().find((item) => (
+    pos.x >= item.x && pos.x <= item.x + item.w && pos.y >= item.y && pos.y <= item.y + item.h
+  ));
+  if (!slot) {
+    state.supplyPickerOpen = false;
+    state.targetLocked = false;
+    return;
+  }
+  const hand = limbs[state.supplyPromptLimb] || limbs[state.selected];
+  if (!hand || hand.joint !== "elbow") return;
+  hand.heldSupply = slot.supply;
+  stone.supplies = stone.supplies.filter((item) => item.id !== slot.supply.id);
+  state.selected = hand.id;
+  state.supplyPickerOpen = false;
+  state.targetLocked = false;
+  state.limbTarget = { x: hand.x, y: hand.y };
+  say(`${hand.label}拿到了${slot.supply.label}。`);
+}
+
+function supplyUsePoint(supply) {
+  if (supply.useTarget === "mouth") return bodyPoint({ x: 0, y: -72 });
+  const injured = mostInjuredSegment();
+  if (injured) return injured.mid;
+  return bodyPoint({ x: 0, y: 0 });
+}
+
+function limbSegments(limb) {
+  return [
+    {
+      limb,
+      key: "upper",
+      condition: limb.segments.upper.condition,
+      start: { x: limb.rootX, y: limb.rootY },
+      end: { x: limb.jointX, y: limb.jointY },
+      mid: { x: (limb.rootX + limb.jointX) / 2, y: (limb.rootY + limb.jointY) / 2 },
+    },
+    {
+      limb,
+      key: "lower",
+      condition: limb.segments.lower.condition,
+      start: { x: limb.jointX, y: limb.jointY },
+      end: { x: limb.x, y: limb.y },
+      mid: { x: (limb.jointX + limb.x) / 2, y: (limb.jointY + limb.y) / 2 },
+    },
+  ];
+}
+
+function allBodySegments() {
+  return Object.values(limbs).flatMap((limb) => limbSegments(limb));
+}
+
+function mostInjuredSegment() {
+  return allBodySegments()
+    .filter((segment) => segment.condition < 0.85)
+    .sort((a, b) => a.condition - b.condition)[0] || null;
+}
+
+function nearestInjuredSegment(point) {
+  return allBodySegments()
+    .filter((segment) => segment.condition < 0.85)
+    .map((segment) => ({ ...segment, d: distance(point, segment.mid) }))
+    .filter((segment) => segment.d <= 38)
+    .sort((a, b) => a.d - b.d || a.condition - b.condition)[0] || null;
+}
+
+function tryUseHeldSupply(limb) {
+  const supply = limb.heldSupply;
+  if (!supply) return;
+  if (supply.id === "bandage") {
+    if (!nearestInjuredSegment(limb)) {
+      say("绷带还没送到受伤部位。");
+      return;
+    }
+    useHeldSupply(limb);
+    return;
+  }
+  const target = supplyUsePoint(supply);
+  if (distance(limb, target) > 34) {
+    say(`${supply.label}还没送到可使用位置。`);
+    return;
+  }
+  useHeldSupply(limb);
+}
+
+function useHeldSupply(limb) {
+  const supply = limb.heldSupply;
+  if (!supply) return;
+  if (supply.id === "water") {
+    for (const item of Object.values(limbs)) item.fatigue = Math.max(0, item.fatigue - 0.1);
+  } else if (supply.id === "biscuit") {
+    for (const item of Object.values(limbs)) item.fatigue = Math.max(0, item.fatigue - 0.16);
+  } else if (supply.id === "bandage") {
+    const injured = nearestInjuredSegment(limb);
+    if (!injured) {
+      say("绷带还没对准受伤部位。");
+      return;
+    }
+    injured.limb.segments[injured.key].condition = Math.min(0.85, injured.limb.segments[injured.key].condition + 0.45);
+    injured.limb.fatigue = Math.max(0, injured.limb.fatigue - 0.18);
+    say(`${limb.label}包扎了${segmentLabel(injured.limb, injured.key)}。`);
+    limb.heldSupply = null;
+    return;
+  }
+  say(`${limb.label}使用了${supply.label}。`);
+  limb.heldSupply = null;
+}
+
 function gripAt(x, y) {
   const candidates = [...holds];
   if (stone.isFixed) candidates.push(stone);
@@ -745,7 +1373,7 @@ function gripAt(x, y) {
     .map((item) => ({ item, d: Math.hypot(item.x - x, item.y - y) }))
     .sort((a, b) => a.d - b.d)[0];
   if (nearest && nearest.d <= CFG.gripRadius) {
-    return { ...nearest.item, grip: nearest.item.grip ?? 1, kind: nearest.item === stone ? "stone" : "hold" };
+    return { ...nearest.item, grip: nearest.item.grip ?? 1, kind: nearest.item === stone ? "robot" : "hold" };
   }
   const rough = roughPatches.find((patch) => x >= patch.x && x <= patch.x + patch.w && y >= patch.y && y <= patch.y + patch.h);
   if (rough) return { id: `rough-${Math.round(x)}-${Math.round(y)}`, x, y, grip: rough.grip, kind: "rough" };
@@ -791,6 +1419,7 @@ function capturePoseSnapshot() {
         attached: limb.attached,
         targetId: limb.target?.id || null,
         targetKind: limb.target?.kind || null,
+        heldSupply: limb.heldSupply ? limb.heldSupply.id : null,
         endpoint: roundPoint(limb),
         root: roundPoint(root),
         jointPoint: { x: roundNumber(limb.jointX), y: roundNumber(limb.jointY) },
@@ -799,6 +1428,17 @@ function capturePoseSnapshot() {
         rootToEnd: roundNumber(rootToEnd),
         maxReach: roundNumber(reach),
         reachRatio: roundNumber(rootToEnd / reach),
+        power: roundNumber(limbPower(limb)),
+        segments: {
+          upper: {
+            label: segmentLabel(limb, "upper"),
+            condition: roundNumber(limb.segments.upper.condition),
+          },
+          lower: {
+            label: segmentLabel(limb, "lower"),
+            condition: roundNumber(limb.segments.lower.condition),
+          },
+        },
         segmentLengths: {
           upper: roundNumber(upper),
           lower: roundNumber(lower),
@@ -909,20 +1549,20 @@ function detachLimb(limb, message) {
 
 function toggleStone() {
   if (stone.isFixed) {
-    releaseStone("石头解除固定。");
+    releaseStone("攀岩机器人解除固定。");
     return;
   }
   constrainStoneNearBody();
   stone.isFixed = true;
   stone.currentLoadTime = Math.min(stone.currentLoadTime, CFG.stoneMaxLoadTime * 0.5);
-  say("石头已固定，可作为临时手点或脚点。");
+  say("攀岩机器人已固定，可作为临时手点、脚点或物资点。");
 }
 
 function releaseStone(message) {
   stone.isFixed = false;
   stone.shake = 0;
   for (const limb of Object.values(limbs)) {
-    if (limb.target === stone) detachLimb(limb, "抓住石头的肢体已脱落。");
+    if (limb.target === stone) detachLimb(limb, "抓住攀岩机器人的肢体已脱落。");
   }
   say(message);
 }
@@ -932,10 +1572,15 @@ function resetGame() {
   state.cameraY = 1180;
   state.selected = "leftHand";
   state.won = false;
+  state.supplyPickerOpen = false;
+  state.supplyPromptLimb = null;
+  state.bodyExtensionTarget = null;
+  state.ropePoints = null;
   stone.x = state.body.x + 110;
   stone.y = state.body.y - 40;
   stone.isFixed = false;
   stone.currentLoadTime = 0;
+  stone.supplies = defaultSupplies();
   for (const def of limbDefs) {
     const limb = limbs[def.id];
     limb.x = state.body.x + def.rest.x;
@@ -946,6 +1591,8 @@ function resetGame() {
     limb.jointY = state.body.y + (def.root.y + def.rest.y) / 2;
     limb.attached = false;
     limb.target = null;
+    limb.heldSupply = null;
+    limb.segments = createSegments();
     limb.grip = 1;
     limb.fatigue = 0;
   }
@@ -959,6 +1606,8 @@ function draw() {
   ctx.translate(0, -state.cameraY);
   drawWall();
   drawHolds();
+  drawMapDecorations();
+  drawRope();
   drawStone();
   drawClimber();
   ctx.restore();
@@ -1011,20 +1660,146 @@ function drawHolds() {
   }
 }
 
+function drawMapDecorations() {
+  for (const item of mapDecorations) {
+    const dy = item.y - state.cameraY;
+    if (dy < -80 || dy > canvas.height + 80) continue;
+    drawMapAsset(ctx, item, item.x, item.y, MAP_SCALE);
+  }
+}
+
 function drawStone() {
   const x = stone.x + stone.shake * (Math.random() - 0.5);
   const y = stone.y + stone.shake * (Math.random() - 0.5);
-  ctx.fillStyle = stone.isFixed ? "#6bd1d5" : "#d8d0b0";
-  ctx.strokeStyle = stone.isFixed ? "#d3fbff" : "#fff1c8";
+  ctx.fillStyle = stone.isFixed ? "#5fb7c8" : "#9aa7ad";
+  ctx.strokeStyle = stone.isFixed ? "#d3fbff" : "#dce4e7";
   ctx.lineWidth = 3;
   ctx.beginPath();
-  ctx.arc(x, y, stone.r, 0, Math.PI * 2);
+  ctx.roundRect(x - stone.r, y - stone.r, stone.r * 2, stone.r * 2, 8);
   ctx.fill();
   ctx.stroke();
+  ctx.fillStyle = "#182024";
+  ctx.fillRect(x - 9, y - 5, 6, 6);
+  ctx.fillRect(x + 3, y - 5, 6, 6);
+  ctx.strokeStyle = "#182024";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x - 8, y + 9);
+  ctx.lineTo(x + 8, y + 9);
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "11px Segoe UI, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("攀岩机器人", x, y + stone.r + 16);
+  ctx.textAlign = "left";
   if (!stone.isFixed) {
     ctx.strokeStyle = "rgba(107,209,213,0.22)";
     ctx.beginPath();
     ctx.arc(state.body.x, state.body.y, CFG.moveRadius, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (state.supplyPromptLimb && !state.supplyPickerOpen) {
+    drawRobotPrompt(x, y);
+  }
+  if (state.supplyPickerOpen) {
+    drawSupplyPicker();
+  }
+}
+
+function drawRope() {
+  ensureRopePoints();
+  pinRopeEnds();
+  const points = state.ropePoints;
+  const anchor = points[0];
+  const end = points[points.length - 1];
+  const dist = Math.hypot(end.x - anchor.x, end.y - anchor.y);
+  const tension = clamp(dist / CFG.moveRadius, 0, 1);
+  ctx.save();
+  ctx.strokeStyle = tension > 0.92 ? "#f2cf75" : "rgba(216,226,228,0.72)";
+  ctx.lineWidth = 2 + tension * 2;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length - 1; i++) {
+    const midX = (points[i].x + points[i + 1].x) / 2;
+    const midY = (points[i].y + points[i + 1].y) / 2;
+    ctx.quadraticCurveTo(points[i].x, points[i].y, midX, midY);
+  }
+  ctx.lineTo(end.x, end.y);
+  ctx.stroke();
+  ctx.fillStyle = "#d8e2e4";
+  ctx.beginPath();
+  ctx.arc(anchor.x, anchor.y, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(end.x, end.y, 4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawRobotPrompt(x, y) {
+  ctx.fillStyle = "rgba(16,20,22,0.86)";
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.lineWidth = 1;
+  const text = "按 F 拿取物资";
+  ctx.font = "13px Segoe UI, sans-serif";
+  const w = ctx.measureText(text).width + 22;
+  const h = 28;
+  ctx.beginPath();
+  ctx.roundRect(x - w / 2, y - stone.r - 42, w, h, 8);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.fillText(text, x, y - stone.r - 23);
+  ctx.textAlign = "left";
+}
+
+function drawSupplyPicker() {
+  for (const slot of supplySlots()) {
+    ctx.fillStyle = "rgba(16,20,22,0.9)";
+    ctx.strokeStyle = "rgba(255,255,255,0.32)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(slot.x, slot.y, slot.w, slot.h, 7);
+    ctx.fill();
+    ctx.stroke();
+    drawSupplyIcon(slot.supply, slot.x + slot.w / 2, slot.y + slot.h / 2, 11);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "10px Segoe UI, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(slot.supply.label, slot.x + slot.w / 2, slot.y + slot.h + 12);
+    ctx.textAlign = "left";
+  }
+}
+
+function drawSupplyIcon(supply, x, y, size) {
+  ctx.fillStyle = supply.color;
+  ctx.strokeStyle = "#1c2225";
+  ctx.lineWidth = 2;
+  if (supply.id === "water") {
+    ctx.beginPath();
+    ctx.ellipse(x, y, size * 0.62, size, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  } else if (supply.id === "biscuit") {
+    ctx.beginPath();
+    ctx.roundRect(x - size, y - size * 0.65, size * 2, size * 1.3, 4);
+    ctx.fill();
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.roundRect(x - size, y - size * 0.45, size * 2, size * 0.9, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.strokeStyle = "#c86464";
+    ctx.beginPath();
+    ctx.moveTo(x - size * 0.45, y);
+    ctx.lineTo(x + size * 0.45, y);
+    ctx.moveTo(x, y - size * 0.45);
+    ctx.lineTo(x, y + size * 0.45);
     ctx.stroke();
   }
 }
@@ -1064,14 +1839,22 @@ function drawClimber() {
   ctx.restore();
 
   for (const limb of Object.values(limbs)) {
+    if (limb.heldSupply) drawSupplyUseTarget(limb.heldSupply);
+  }
+
+  for (const limb of Object.values(limbs)) {
     solveLimbIK(limb);
-    ctx.strokeStyle = limb.attached ? limb.color : "#8a9397";
     ctx.lineWidth = limb.id.includes("Hand") ? 6 : 7;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    ctx.strokeStyle = segmentColor(limb, "upper");
     ctx.beginPath();
     ctx.moveTo(limb.rootX, limb.rootY);
     ctx.lineTo(limb.jointX, limb.jointY);
+    ctx.stroke();
+    ctx.strokeStyle = segmentColor(limb, "lower");
+    ctx.beginPath();
+    ctx.moveTo(limb.jointX, limb.jointY);
     ctx.lineTo(limb.x, limb.y);
     ctx.stroke();
     ctx.fillStyle = "#1b2023";
@@ -1085,6 +1868,9 @@ function drawClimber() {
     ctx.beginPath();
     ctx.arc(limb.x, limb.y, state.selected === limb.id ? 11 : 8, 0, Math.PI * 2);
     ctx.fill();
+    if (limb.heldSupply) {
+      drawSupplyIcon(limb.heldSupply, limb.x + 13 * limb.side, limb.y - 12, 8);
+    }
     if (limb.attached) {
       ctx.fillStyle = limb.grip > 0.8 ? "#7be08f" : limb.grip > 0.5 ? "#e0b44d" : "#ef6960";
       ctx.font = "10px Segoe UI, sans-serif";
@@ -1111,6 +1897,51 @@ function drawClimber() {
   ctx.beginPath();
   ctx.arc(com.x, com.y, 4, 0, Math.PI * 2);
   ctx.fill();
+}
+
+function drawSupplyUseTarget(supply) {
+  const holder = Object.values(limbs).find((limb) => limb.heldSupply === supply);
+  if (supply.id === "bandage") {
+    const injured = allBodySegments().filter((segment) => segment.condition < 0.85);
+    for (const segment of injured) {
+      drawSupplyTargetCircle(supply, segment.mid);
+    }
+    const near = holder ? nearestInjuredSegment(holder) : null;
+    if (holder && near) drawSupplyPrompt(`按 F 包扎${segmentLabel(near.limb, near.key)}`, near.mid);
+    return;
+  }
+  const target = supplyUsePoint(supply);
+  drawSupplyTargetCircle(supply, target);
+  if (holder && distance(holder, target) <= 34) {
+    drawSupplyPrompt(`按 F 使用${supply.label}`, target);
+  }
+}
+
+function drawSupplyTargetCircle(supply, target) {
+  ctx.strokeStyle = supply.color;
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.arc(target.x, target.y, 22, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawSupplyPrompt(text, target) {
+  ctx.fillStyle = "rgba(16,20,22,0.86)";
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.font = "13px Segoe UI, sans-serif";
+  const w = ctx.measureText(text).width + 22;
+  ctx.beginPath();
+  ctx.roundRect(target.x - w / 2, target.y - 48, w, 28, 8);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = "#ffffff";
+  ctx.textAlign = "center";
+  ctx.fillText(text, target.x, target.y - 29);
+  ctx.textAlign = "left";
 }
 
 function drawStabilityGuide(attached) {
@@ -1177,7 +2008,7 @@ function updateUi() {
     : "可移动";
   updateLimbPanel();
   if (state.messageTimer <= 0 && !state.won) {
-    ui.message.textContent = state.stability < 0.4 ? "姿态不稳定，尽快增加支点或调整重心。" : "协作移动石头，跨过无抓点缺口。";
+    ui.message.textContent = state.stability < 0.4 ? "姿态不稳定，尽快增加支点或调整重心。" : "协作移动攀岩机器人，跨过无抓点缺口。";
   }
 }
 
